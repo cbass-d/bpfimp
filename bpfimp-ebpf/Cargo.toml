@@ -1,0 +1,18 @@
+[package]
+name = "bpfimp-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bpfimp-common = { path = "../bpfimp-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+network-types = "0.2.0"
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "bpfimp"
+path = "src/main.rs"
