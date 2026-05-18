@@ -133,11 +133,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Exiting...");
                 break;
             }
+
             Some(Ok(events)) = rx.recv() => {
-                //for e in &events {
-                //    info!("kind: {:?}", e.kind);
-                //}
-                if events.iter().any(|e| matches!(e.kind, EventKind::Access(AccessKind::Close(AccessMode::Write))) && e.paths.iter().any(|p| p.ends_with(&peers_config))) {
+                let is_config_save = |e: &DebouncedEvent| {
+                    matches!(e.kind, EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                    && e.paths.iter().any(|p| p.ends_with(&peers_config))
+                };
+
+                if events.iter().any(is_config_save) {
                     match reload_known_peers(&mut ebpf, &peers_config) {
                         Ok(n) => info!("loaded {n} known peers from {}", peers_config.display()),
                         Err(e) => warn!("peers reload failed: {e:#}"),
