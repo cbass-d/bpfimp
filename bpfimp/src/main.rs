@@ -1,4 +1,8 @@
-use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use aya::{
@@ -8,6 +12,12 @@ use aya::{
 use bpfimp_common::Reputation;
 use clap::Parser;
 use log::info;
+use notify::{
+    Event, EventKind, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode},
+};
+use notify_debouncer_full::{DebouncedEvent, new_debouncer};
+use tokio::sync::mpsc;
 #[rustfmt::skip]
 use log::{debug, warn};
 use tokio::signal;
@@ -109,7 +119,13 @@ async fn main() -> anyhow::Result<()> {
     println!("Waiting for Ctrl-C...");
 
     let mut interval = tokio::time::interval(Duration::from_secs(10));
-    let mut reload = tokio::time::interval(Duration::from_secs(30));
+
+    let (tx, mut rx) = mpsc::channel(10);
+    let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
+        let _ = tx.blocking_send(res);
+    })?;
+    let parent = peers_config.parent().unwrap_or(Path::new("."));
+    debouncer.watch(parent, RecursiveMode::NonRecursive)?;
 
     loop {
         tokio::select! {
@@ -117,10 +133,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("Exiting...");
                 break;
             }
-            _ = reload.tick() => {
-                match reload_known_peers(&mut ebpf, &peers_config) {
-                    Ok(n) => info!("loaded {n} known peers from {}", peers_config.display()),
-                    Err(e) => warn!("peers reload failed: {e:#}"),
+            Some(Ok(events)) = rx.recv() => {
+                //for e in &events {
+                //    info!("kind: {:?}", e.kind);
+                //}
+                if events.iter().any(|e| matches!(e.kind, EventKind::Access(AccessKind::Close(AccessMode::Write))) && e.paths.iter().any(|p| p.ends_with(&peers_config))) {
+                    match reload_known_peers(&mut ebpf, &peers_config) {
+                        Ok(n) => info!("loaded {n} known peers from {}", peers_config.display()),
+                        Err(e) => warn!("peers reload failed: {e:#}"),
+                    }
                 }
             }
             _ = interval.tick() => {

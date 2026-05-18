@@ -14,10 +14,12 @@ aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "sync"] }
 clap = { workspace = true, features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
