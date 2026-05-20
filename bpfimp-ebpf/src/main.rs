@@ -94,8 +94,11 @@ fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
     let src_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
 
     if let Some(entry) = BLOCKED_BUCKETS.get_ptr_mut(&src_addr) {
+        trace!(&ctx, "packet from blocked ip");
+
         unsafe {
             (*entry).hits += 1;
+            info!(&ctx, "hit: {}", (*entry).hits);
             (*entry).last_seen_ns = bpf_ktime_get_ns();
         }
 
@@ -146,7 +149,6 @@ fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
     };
 
     if !allowed {
-        info!(&ctx, "packet dropped");
         return Ok(xdp_action::XDP_DROP);
     }
 
