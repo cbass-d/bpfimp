@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt + clippy + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install nightly toolchain (for eBPF)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: bpfel-unknown-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bpfimp
+          cache-on-failure: true
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (workspace)
+        run: cargo clippy --workspace --exclude bpfimp-ebpf --all-targets -- -D warnings
+
+      - name: cargo clippy (ebpf)
+        run: cargo +nightly clippy --package bpfimp-ebpf --target bpfel-unknown-none -Z build-std=core -- -D warnings
+
+      - name: cargo build (release)
+        run: cargo build --workspace --exclude bpfimp-ebpf --release
