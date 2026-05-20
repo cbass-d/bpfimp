@@ -9,7 +9,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 VETH_HOST="${VETH_HOST:-vbpfimp0}"
-PEERS_CONFIG="${PEERS_CONFIG:-peers.toml}"
+PEERS_CONFIG="${PEERS_CONFIG:-bpfimp.toml}"
 RUST_LOG="${RUST_LOG:-info}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,4 +21,4 @@ cargo build --release
 echo "[run] attaching bpfimp to $VETH_HOST (peers=$PEERS_CONFIG)"
 sudo RUST_LOG="$RUST_LOG" ./target/release/bpfimp \
     --iface "$VETH_HOST" \
-    --peers-config "$PEERS_CONFIG"
+    --config "$PEERS_CONFIG"

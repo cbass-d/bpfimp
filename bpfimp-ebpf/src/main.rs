@@ -12,8 +12,11 @@ use aya_ebpf::{
     maps::{HashMap, LruHashMap},
     programs::XdpContext,
 };
-use aya_log_ebpf::info;
-use bpfimp_common::{MAX_TOKENS, REFILL_PER_SEC, Reputation, TokenBucket};
+use aya_log_ebpf::{info, trace};
+use bpfimp_common::{
+    BlockedEntry, MAX_SCORE, MAX_TOKENS, MIN_SCORE_TO_PASS, PENALTY, REFILL_PER_SEC, Reputation,
+    TokenBucket,
+};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::Ipv4Hdr,
@@ -23,8 +26,12 @@ use network_types::{
 static PACKET_COUNTS: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1024, 0);
 
 #[map]
-static KNOWN_BUCKETS: LruHashMap<u32, Reputation> =
+static ALLOWED_BUCKETS: LruHashMap<u32, Reputation> =
     LruHashMap::<u32, Reputation>::with_max_entries(1024, 0);
+
+#[map]
+static BLOCKED_BUCKETS: LruHashMap<u32, BlockedEntry> =
+    LruHashMap::<u32, BlockedEntry>::with_max_entries(1024, 0);
 
 #[map]
 static UKNOWN_BUCKETS: LruHashMap<u32, TokenBucket> =
@@ -52,7 +59,13 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 }
 
 #[inline(always)]
-unsafe fn try_consume(b: *mut TokenBucket, max: u32, refill_per_sec: u32, now: u64) -> bool {
+unsafe fn try_consume(
+    ctx: &XdpContext,
+    b: *mut TokenBucket,
+    max: u32,
+    refill_per_sec: u32,
+    now: u64,
+) -> bool {
     let elapsed = (now - (*b).last_refill_ns) / NS_PER_SEC;
     if elapsed >= 1 {
         let add = (elapsed as u32).saturating_mul(refill_per_sec);
@@ -63,6 +76,7 @@ unsafe fn try_consume(b: *mut TokenBucket, max: u32, refill_per_sec: u32, now: u
     if (*b).tokens == 0 {
         return false;
     }
+
     (*b).tokens -= 1;
 
     true
@@ -79,15 +93,24 @@ fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
     let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
     let src_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
 
+    if let Some(entry) = BLOCKED_BUCKETS.get_ptr_mut(&src_addr) {
+        unsafe {
+            (*entry).hits += 1;
+            (*entry).last_seen_ns = bpf_ktime_get_ns();
+        }
+
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     unsafe {
         match PACKET_COUNTS.get_ptr_mut(&src_addr) {
             Some(counter) => {
                 *counter += 1;
-                info!(&ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
+                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
             }
             None => {
                 let _ = PACKET_COUNTS.insert(&src_addr, &1, 1);
-                info!(&ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
+                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
             }
         }
     }
@@ -95,18 +118,35 @@ fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
     let now = unsafe { bpf_ktime_get_ns() };
 
     let allowed = unsafe {
-        if let Some(rep) = KNOWN_BUCKETS.get_ptr_mut(&src_addr) {
-            try_consume(&mut (*rep).bucket, MAX_TOKENS, REFILL_PER_SEC, now)
+        if let Some(rep) = ALLOWED_BUCKETS.get_ptr_mut(&src_addr) {
+            let is_ok = ((*rep).score >= MIN_SCORE_TO_PASS)
+                && try_consume(&ctx, &mut (*rep).bucket, MAX_TOKENS, REFILL_PER_SEC, now);
+
+            info!(
+                &ctx,
+                "value of ok: {}",
+                if is_ok { "true" } else { "false" }
+            );
+
+            if is_ok {
+                (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
+            } else {
+                info!(&ctx, "IP: {} penalized", src_addr);
+                (*rep).score = (*rep).score.saturating_sub(PENALTY);
+            }
+
+            is_ok
         } else if let Some(b) = UKNOWN_BUCKETS.get_ptr_mut(&src_addr) {
-            try_consume(b, MAX_TOKENS, REFILL_PER_SEC, now)
+            try_consume(&ctx, b, MAX_TOKENS, REFILL_PER_SEC, now)
         } else {
-            let fresh = TokenBucket::new(now);
+            let fresh = TokenBucket::new(now, true);
             let _ = UKNOWN_BUCKETS.insert(&src_addr, &fresh, 0);
             true
         }
     };
 
     if !allowed {
+        info!(&ctx, "packet dropped");
         return Ok(xdp_action::XDP_DROP);
     }
 
