@@ -46,7 +46,7 @@ fn clock_now_ns() -> u64 {
     (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64
 }
 
-fn reload_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
+fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read from {}", path.display()))?;
     let cfg: Config = toml::from_str(&raw)?;
@@ -139,6 +139,14 @@ async fn main() -> anyhow::Result<()> {
     let parent = config.parent().unwrap_or(Path::new("."));
     debouncer.watch(parent, RecursiveMode::NonRecursive)?;
 
+    match load_config_lists(&mut ebpf, &config) {
+        Ok((n, m)) => info!(
+            "loaded {n} allowed ips and {m} blocked ips from {}",
+            config.display()
+        ),
+        Err(e) => warn!("peers reload failed: {e:#}"),
+    }
+
     loop {
         tokio::select! {
             _  = signal::ctrl_c() => {
@@ -153,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 if events.iter().any(is_config_save) {
-                    match reload_config_lists(&mut ebpf, &config) {
+                    match load_config_lists(&mut ebpf, &config) {
                         Ok((n, m)) => info!("loaded {n} allowed ips and {m} blocked ips from {}", config.display()),
                         Err(e) => warn!("peers reload failed: {e:#}"),
                     }
