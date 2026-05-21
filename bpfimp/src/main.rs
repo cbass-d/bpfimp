@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::{
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -26,7 +26,7 @@ use log::{debug, warn};
 use tokio::signal;
 
 #[derive(Debug, Parser)]
-struct Opt {
+struct Opts {
     #[clap(short, long, default_value = "wlan0")]
     iface: String,
     #[clap(short, long, default_value = "bpfimp.toml")]
@@ -51,35 +51,62 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
         .with_context(|| format!("failed to read from {}", path.display()))?;
     let cfg: Config = toml::from_str(&raw)?;
 
-    let mut allowed: HashMap<_, u32, Reputation> = HashMap::try_from(
-        ebpf.map_mut("ALLOWED_BUCKETS")
-            .context("ALLOWED_BUCKETS map missing")?,
+    let mut allowed_v4: HashMap<_, u32, Reputation> = HashMap::try_from(
+        ebpf.map_mut("ALLOWED_BUCKETS_V4")
+            .context("ALLOWED_BUCKETS_V4 map missing")?,
     )?;
+
+    let (allow_v4, allow_v6) = partition_list(&cfg.allowlist);
+    let (block_v4, block_v6) = partition_list(&cfg.blocklist);
 
     let now = clock_now_ns();
-    for ip_str in &cfg.allowlist {
-        let ip: Ipv4Addr = ip_str.parse().with_context(|| format!("bad ip {ip_str}"))?;
-        let key: u32 = ip.into();
-        allowed.insert(key, Reputation::new(now), 0)?;
+
+    let mut m: HashMap<_, u32, Reputation> =
+        HashMap::try_from(ebpf.map_mut("ALLOWED_BUCKETS_V4").context("missing")?)?;
+    for k in &allow_v4 {
+        m.insert(k, Reputation::new(now), 0)?;
     }
 
-    let mut blocked: HashMap<_, u32, BlockedEntry> = HashMap::try_from(
-        ebpf.map_mut("BLOCKED_BUCKETS")
-            .context("BLOCKED_BUCKETS map missing")?,
-    )?;
-
-    for ip_str in &cfg.blocklist {
-        let ip: Ipv4Addr = ip_str.parse().with_context(|| format!("bad ip {ip_str}"))?;
-        let key: u32 = ip.into();
-        blocked.insert(key, BlockedEntry::default(), 0)?;
+    let mut m: HashMap<_, [u8; 16], Reputation> =
+        HashMap::try_from(ebpf.map_mut("ALLOWED_BUCKETS_V6").context("missing")?)?;
+    for k in &allow_v6 {
+        m.insert(k, Reputation::new(now), 0)?;
     }
 
-    Ok((cfg.allowlist.len(), cfg.blocklist.len()))
+    let mut m: HashMap<_, u32, BlockedEntry> =
+        HashMap::try_from(ebpf.map_mut("BLOCKED_BUCKETS_V4").context("missing")?)?;
+    for k in &block_v4 {
+        m.insert(k, BlockedEntry::default(), 0)?;
+    }
+
+    let mut m: HashMap<_, [u8; 16], BlockedEntry> =
+        HashMap::try_from(ebpf.map_mut("BLOCKED_BUCKETS_V6").context("missing")?)?;
+    for k in &block_v6 {
+        m.insert(k, BlockedEntry::default(), 0)?;
+    }
+
+    Ok((
+        allow_v4.len() + allow_v6.len(),
+        block_v4.len() + block_v6.len(),
+    ))
+}
+
+fn partition_list(list: &[String]) -> (Vec<u32>, Vec<[u8; 16]>) {
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    for ip_str in list {
+        match ip_str.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => v4.push(ip.into()),
+            Ok(IpAddr::V6(ip)) => v6.push(ip.octets()),
+            Err(e) => warn!("invalid ip: {e}"),
+        }
+    }
+
+    (v4, v6)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::parse();
+    let opt = Opts::parse();
 
     env_logger::init();
 
@@ -119,26 +146,25 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let Opt { iface, config } = opt;
+
+    let Opts { iface, config } = opt;
     let program: &mut Xdp = ebpf.program_mut("bpfimp").unwrap().try_into()?;
     program.load()?;
     program.attach(&iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
-
     info!("attached to the {} interface", iface);
 
     println!("Waiting for Ctrl-C...");
 
     let mut interval = tokio::time::interval(Duration::from_secs(10));
-
     let (tx, mut rx) = mpsc::channel(10);
     let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
         let _ = tx.blocking_send(res);
     })?;
-
     let parent = config.parent().unwrap_or(Path::new("."));
     debouncer.watch(parent, RecursiveMode::NonRecursive)?;
 
+    // Initial load of config
     match load_config_lists(&mut ebpf, &config) {
         Ok((n, m)) => info!(
             "loaded {n} allowed ips and {m} blocked ips from {}",

@@ -19,23 +19,39 @@ use bpfimp_common::{
 };
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::Ipv4Hdr,
+    ip::{Ipv4Hdr, Ipv6Hdr},
 };
 
 #[map]
-static PACKET_COUNTS: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1024, 0);
+static PACKET_COUNTS_V4: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1024, 0);
 
 #[map]
-static ALLOWED_BUCKETS: LruHashMap<u32, Reputation> =
+static PACKET_COUNTS_V6: HashMap<[u8; 16], u64> =
+    HashMap::<[u8; 16], u64>::with_max_entries(1024, 0);
+
+#[map]
+static ALLOWED_BUCKETS_V4: LruHashMap<u32, Reputation> =
     LruHashMap::<u32, Reputation>::with_max_entries(1024, 0);
 
 #[map]
-static BLOCKED_BUCKETS: LruHashMap<u32, BlockedEntry> =
+static ALLOWED_BUCKETS_V6: LruHashMap<[u8; 16], Reputation> =
+    LruHashMap::<[u8; 16], Reputation>::with_max_entries(1024, 0);
+
+#[map]
+static BLOCKED_BUCKETS_V4: LruHashMap<u32, BlockedEntry> =
     LruHashMap::<u32, BlockedEntry>::with_max_entries(1024, 0);
 
 #[map]
-static UKNOWN_BUCKETS: LruHashMap<u32, TokenBucket> =
+static BLOCKED_BUCKETS_V6: LruHashMap<[u8; 16], BlockedEntry> =
+    LruHashMap::<[u8; 16], BlockedEntry>::with_max_entries(1024, 0);
+
+#[map]
+static UNKNOWN_BUCKETS_V4: LruHashMap<u32, TokenBucket> =
     LruHashMap::<u32, TokenBucket>::with_max_entries(1024, 0);
+
+#[map]
+static UNKNOWN_BUCKETS_V6: LruHashMap<[u8; 16], TokenBucket> =
+    LruHashMap::<[u8; 16], TokenBucket>::with_max_entries(1024, 0);
 
 #[xdp]
 pub fn bpfimp(ctx: XdpContext) -> u32 {
@@ -82,18 +98,11 @@ unsafe fn try_consume(
     true
 }
 
-fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
-    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
-
-    match unsafe { (*ethhdr).ether_type() } {
-        Ok(EtherType::Ipv4) => {}
-        _ => return Ok(xdp_action::XDP_PASS),
-    }
-
+fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
     let src_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
 
-    if let Some(entry) = BLOCKED_BUCKETS.get_ptr_mut(&src_addr) {
+    if let Some(entry) = BLOCKED_BUCKETS_V4.get_ptr_mut(&src_addr) {
         trace!(&ctx, "packet from blocked ip");
 
         unsafe {
@@ -102,34 +111,27 @@ fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
             (*entry).last_seen_ns = bpf_ktime_get_ns();
         }
 
-        return Ok(xdp_action::XDP_DROP);
+        return Ok(false);
     }
 
     unsafe {
-        match PACKET_COUNTS.get_ptr_mut(&src_addr) {
+        match PACKET_COUNTS_V4.get_ptr_mut(&src_addr) {
             Some(counter) => {
                 *counter += 1;
                 trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
             }
             None => {
-                let _ = PACKET_COUNTS.insert(&src_addr, &1, 1);
+                let _ = PACKET_COUNTS_V4.insert(&src_addr, &1, 1);
                 trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
             }
         }
     }
 
     let now = unsafe { bpf_ktime_get_ns() };
-
     let allowed = unsafe {
-        if let Some(rep) = ALLOWED_BUCKETS.get_ptr_mut(&src_addr) {
+        if let Some(rep) = ALLOWED_BUCKETS_V4.get_ptr_mut(&src_addr) {
             let is_ok = ((*rep).score >= MIN_SCORE_TO_PASS)
                 && try_consume(&ctx, &mut (*rep).bucket, MAX_TOKENS, REFILL_PER_SEC, now);
-
-            info!(
-                &ctx,
-                "value of ok: {}",
-                if is_ok { "true" } else { "false" }
-            );
 
             if is_ok {
                 (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
@@ -139,13 +141,80 @@ fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
             }
 
             is_ok
-        } else if let Some(b) = UKNOWN_BUCKETS.get_ptr_mut(&src_addr) {
+        } else if let Some(b) = UNKNOWN_BUCKETS_V4.get_ptr_mut(&src_addr) {
             try_consume(&ctx, b, MAX_TOKENS, REFILL_PER_SEC, now)
         } else {
             let fresh = TokenBucket::new(now, true);
-            let _ = UKNOWN_BUCKETS.insert(&src_addr, &fresh, 0);
+            let _ = UNKNOWN_BUCKETS_V4.insert(&src_addr, &fresh, 0);
             true
         }
+    };
+
+    Ok(allowed)
+}
+
+fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
+    let ipv6hdr: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+    let src_addr = unsafe { (*ipv6hdr).src_addr };
+
+    if let Some(entry) = BLOCKED_BUCKETS_V6.get_ptr_mut(&src_addr) {
+        trace!(&ctx, "packet from blocked ip");
+
+        unsafe {
+            (*entry).hits += 1;
+            info!(&ctx, "hit: {}", (*entry).hits);
+            (*entry).last_seen_ns = bpf_ktime_get_ns();
+        }
+
+        return Ok(false);
+    }
+
+    unsafe {
+        match PACKET_COUNTS_V6.get_ptr_mut(&src_addr) {
+            Some(counter) => {
+                *counter += 1;
+                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
+            }
+            None => {
+                let _ = PACKET_COUNTS_V6.insert(&src_addr, &1, 1);
+                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
+            }
+        }
+    }
+
+    let now = unsafe { bpf_ktime_get_ns() };
+    let allowed = unsafe {
+        if let Some(rep) = ALLOWED_BUCKETS_V6.get_ptr_mut(&src_addr) {
+            let is_ok = (*rep).score >= MIN_SCORE_TO_PASS
+                && try_consume(&ctx, &mut (*rep).bucket, MAX_TOKENS, REFILL_PER_SEC, now);
+
+            if is_ok {
+                (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
+            } else {
+                info!(&ctx, "IPv6 {:i} penalized", src_addr);
+                (*rep).score = (*rep).score.saturating_sub(PENALTY);
+            }
+
+            is_ok
+        } else if let Some(b) = UNKNOWN_BUCKETS_V6.get_ptr_mut(&src_addr) {
+            try_consume(&ctx, b, MAX_TOKENS, REFILL_PER_SEC, now)
+        } else {
+            let fresh = TokenBucket::new(now, true);
+            let _ = UNKNOWN_BUCKETS_V6.insert(&src_addr, &fresh, 0);
+            true
+        }
+    };
+
+    Ok(allowed)
+}
+
+fn try_bpfimp(ctx: XdpContext) -> Result<u32, ()> {
+    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
+
+    let allowed = match unsafe { (*ethhdr).ether_type() } {
+        Ok(EtherType::Ipv4) => handle_ipv4(&ctx)?,
+        Ok(EtherType::Ipv6) => handle_ipv6(&ctx)?,
+        _ => return Ok(xdp_action::XDP_PASS),
     };
 
     if !allowed {
