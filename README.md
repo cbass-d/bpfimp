@@ -2,51 +2,66 @@
 
 An XDP-based packet rate limiter written in Rust with [aya]. Traffic is
 classified per source IP and metered against a token bucket in the kernel; a
-small userspace control plane hot-reloads a list of known peers from disk.
+small userspace control plane hot-reloads allow/block lists from disk.
+Handles both IPv4 and IPv6.
 
-> Status: working demo. Tested against a veth/netns harness. IPv4 only.
+> Status: working demo. Tested against a veth/netns harness.
 
 ## What it does
 
-For every IPv4 packet arriving on the attached interface, the XDP program:
+For every IPv4 or IPv6 packet arriving on the attached interface, the XDP
+program:
 
-1. Increments a per-source-IP packet counter (`PACKET_COUNTS`).
-2. Looks the source up in one of two LRU maps:
-   - **Known peers** (`KNOWN_BUCKETS`) — IPs loaded from `peers.toml`. Each has
-     a token bucket *and* a reputation score. The score gates the bucket: an
-     IP only passes if `score >= MIN_SCORE_TO_PASS` *and* a token is available.
-     Successful packets nudge the score up (capped at `MAX_SCORE`); a denied
-     packet subtracts `PENALTY`. This lets a trusted peer absorb a burst but
-     get throttled if it sustains abuse.
-   - **Unknown IPs** (`UNKNOWN_BUCKETS`) — auto-inserted with a smaller
-     starting balance (`NEW_MAX_TOKENS`) and a plain token bucket.
-3. Returns `XDP_PASS` or `XDP_DROP` based on the result.
+1. Looks the source IP up in the **blocklist** map
+   (`BLOCKED_BUCKETS_V4` / `BLOCKED_BUCKETS_V6`). A hit drops the packet and
+   bumps a per-entry hit counter.
+2. Otherwise increments a per-source-IP packet counter
+   (`PACKET_COUNTS_V4` / `PACKET_COUNTS_V6`).
+3. Looks the source up in one of two LRU maps:
+   - **Allowed peers** (`ALLOWED_BUCKETS_V4` / `ALLOWED_BUCKETS_V6`) — IPs
+     loaded from `bpfimp.toml`. Each has a token bucket *and* a reputation
+     score. The score gates the bucket: an IP only passes if
+     `score >= MIN_SCORE_TO_PASS` *and* a token is available. Successful
+     packets nudge the score up (capped at `MAX_SCORE`); a denied packet
+     subtracts `PENALTY`. This lets a trusted peer absorb a burst but get
+     throttled if it sustains abuse.
+   - **Unknown IPs** (`UKNOWN_BUCKETS_V4` / `UKNOWN_BUCKETS_V6`) —
+     auto-inserted with a smaller starting balance (`NEW_MAX_TOKENS`) and a
+     plain token bucket.
+4. Returns `XDP_PASS` or `XDP_DROP` based on the result.
+
+IPv4 and IPv6 are tracked in independent map families; a peer that appears
+under both families gets two independent buckets and reputations.
 
 Userspace (`bpfimp`) loads the program, attaches it to `--iface`, and watches
-`peers.toml` with a debounced filesystem notifier so edits take effect without
-a restart.
+`bpfimp.toml` with a debounced filesystem notifier so edits take effect
+without a restart.
 
 ## Architecture
 
 ```
-                kernel  |  user
-                        |
-   NIC ── XDP hook ─────|
-        │               |
-        ▼               |
-   PACKET_COUNTS        |
-        │               |
-        ▼               |
-   KNOWN_BUCKETS  ◄─────|──── peers.toml  (notify + debouncer)
-   UNKNOWN_BUCKETS      |
-        │               |
-        ▼               |
-   XDP_PASS / XDP_DROP  |
+                  kernel  |  user
+                          |
+   NIC ── XDP hook ───────|
+        │                 |
+        ▼                 |
+   BLOCKED_BUCKETS_V{4,6} ◄──|──┐
+        │                 |    │
+        ▼                 |    ├── bpfimp.toml  (notify + debouncer)
+   PACKET_COUNTS_V{4,6}   |    │
+        │                 |    │
+        ▼                 |    │
+   ALLOWED_BUCKETS_V{4,6} ◄──|─┘
+   UKNOWN_BUCKETS_V{4,6}  |
+        │                 |
+        ▼                 |
+   XDP_PASS / XDP_DROP    |
 ```
 
-The two crates split cleanly: `bpfimp-ebpf` is the `no_std` kernel program,
+The three crates split cleanly: `bpfimp-ebpf` is the `no_std` kernel program,
 `bpfimp` is the Tokio-based loader, and `bpfimp-common` holds the POD types
-(`TokenBucket`, `Reputation`) and policy constants shared by both sides.
+(`TokenBucket`, `Reputation`, `BlockedEntry`) and policy constants shared by
+both sides.
 
 ## Quickstart
 
@@ -76,58 +91,67 @@ sudo ./scripts/teardown_netns.sh
 The attached eBPF logs (`RUST_LOG=info`) show individual `packet dropped` lines
 as the bucket empties during the flood.
 
-## Configuring known peers
+> Note: the netns harness explicitly disables IPv6 on the test veth so the
+> demo isn't polluted by RA/NDP chatter — the v6 code path is exercised on a
+> real interface, not in the scripted demo.
 
-`peers.toml` lists IPs that should be tracked with reputation scoring instead
-of the unknown-IP bucket:
+## Configuring allow/block lists
+
+`bpfimp.toml` lists IPs to reputation-track (`allowlist`) or drop outright
+(`blocklist`). Both IPv4 and IPv6 addresses are accepted; entries are
+dispatched into the right map family based on the parsed address type:
 
 ```toml
-peers = [
+allowlist = [
     "10.200.0.2",
+    "2001:db8::50",
+]
+blocklist = [
     "192.168.1.50",
+    "2001:db8::dead",
 ]
 ```
 
 Edits are picked up live — the userspace watcher debounces filesystem events
-and re-pushes the list into `KNOWN_BUCKETS` on save. Removed IPs naturally age
-out via the LRU map.
+and re-pushes both lists into the kernel maps on save. Removed IPs naturally
+age out via the LRU maps.
 
 ## Policy knobs
 
-The rate-limit constants live in [`bpfimp-common/src/lib.rs`](bpfimp-common/src/lib.rs):
+The rate-limit constants live in [`bpfimp-common/src/lib.rs`](bpfimp-common/src/lib.rs)
+and apply uniformly to both v4 and v6:
 
 | Constant            | Default | Meaning                                                       |
 | ------------------- | ------- | ------------------------------------------------------------- |
-| `MAX_TOKENS`        | 200     | Bucket cap for established (known) peers                      |
+| `MAX_TOKENS`        | 200     | Bucket cap for established (allowed) peers                    |
 | `NEW_MAX_TOKENS`    | 100     | Starting balance for newly-seen unknown IPs                   |
 | `REFILL_PER_SEC`    | 10      | Tokens replenished per second                                 |
 | `MAX_SCORE`         | 100     | Cap on reputation score                                       |
-| `MIN_SCORE_TO_PASS` | 20      | Score floor below which a known peer is dropped               |
+| `MIN_SCORE_TO_PASS` | 20      | Score floor below which an allowed peer is dropped            |
 | `PENALTY`           | 10      | Score subtracted on a denied packet                           |
 
 With the defaults a steady rate above ~10 pkt/s will eventually empty an
-unknown IP's bucket; a known peer with a healthy score absorbs bursts up to
+unknown IP's bucket; an allowed peer with a healthy score absorbs bursts up to
 200 packets before throttling.
 
 ## CLI
 
 ```
-bpfimp --iface <NAME> [--peers-config <PATH>]
+bpfimp --iface <NAME> [--config <PATH>]
 
-  -i, --iface         interface to attach XDP to (default: wlp0s20f3)
-  -p, --peers-config  path to peers.toml (default: ./peers.toml)
+  -i, --iface   interface to attach XDP to (default: wlan0)
+  -c, --config  path to bpfimp.toml (default: ./bpfimp.toml)
 ```
 
 `RUST_LOG=info` (or `debug`/`trace`) controls log verbosity.
 
 ## Limitations
 
-- **IPv4 only.** IPv6 packets are passed through unmetered. The netns setup
-  script explicitly disables v6 on the test veth so the demo isn't polluted by
-  RA/NDP chatter.
 - **No persistent counters.** Maps are zeroed on program reload.
 - **Reputation doesn't decay over time** — a penalized IP that goes silent
   stays penalized until evicted from the LRU map.
+- **v4 and v6 of the same peer are tracked independently** — no cross-family
+  association.
 - XDP attach defaults to native mode; on interfaces that don't support it
   (some virtio configs), switch to `XdpFlags::SKB_MODE` in
   `bpfimp/src/main.rs`.
