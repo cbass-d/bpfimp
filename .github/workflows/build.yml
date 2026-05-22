@@ -23,10 +23,12 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install nightly toolchain (for eBPF)
+        # bpfel-unknown-none is a tier-3 target with no prebuilt rust-std;
+        # we build core from source via `-Z build-std=core` in the clippy
+        # step below, which only requires the rust-src component.
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-          targets: bpfel-unknown-none
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
