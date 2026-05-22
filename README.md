@@ -81,8 +81,10 @@ sudo ./scripts/setup_netns.sh
 sudo ./scripts/run_bpfimp.sh
 
 # 3. In another shell, generate traffic
-sudo ./scripts/gen_traffic.sh        # 20 pings at 1/s — should all pass
-sudo ./scripts/gen_traffic.sh burst  # ping flood — bucket drains, drops appear
+sudo ./scripts/gen_traffic.sh         # 20 v4 pings at 1/s — should all pass
+sudo ./scripts/gen_traffic.sh burst   # v4 flood — bucket drains, drops appear
+sudo ./scripts/gen_traffic.sh ping6   # same against the v6 ULA (fd00:200::1)
+sudo ./scripts/gen_traffic.sh burst6  # v6 flood
 
 # 4. Tear it all down
 sudo ./scripts/teardown_netns.sh
@@ -91,9 +93,10 @@ sudo ./scripts/teardown_netns.sh
 The attached eBPF logs (`RUST_LOG=info`) show individual `packet dropped` lines
 as the bucket empties during the flood.
 
-> Note: the netns harness explicitly disables IPv6 on the test veth so the
-> demo isn't polluted by RA/NDP chatter — the v6 code path is exercised on a
-> real interface, not in the scripted demo.
+The harness assigns both an IPv4 (`10.200.0.0/24`) and an IPv6 ULA
+(`fd00:200::/64`) address to each end of the veth, so both code paths are
+exercised. Router advertisements and autoconf are disabled on the test
+interfaces to keep address state deterministic.
 
 ## Configuring allow/block lists
 

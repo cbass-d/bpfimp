@@ -107,7 +107,6 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
 
         unsafe {
             (*entry).hits += 1;
-            info!(&ctx, "hit: {}", (*entry).hits);
             (*entry).last_seen_ns = bpf_ktime_get_ns();
         }
 
@@ -162,7 +161,6 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
 
         unsafe {
             (*entry).hits += 1;
-            info!(&ctx, "hit: {}", (*entry).hits);
             (*entry).last_seen_ns = bpf_ktime_get_ns();
         }
 

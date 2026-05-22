@@ -3,7 +3,9 @@
 #
 # Topology:
 #
-#   host  vbpfimp0 (10.200.0.1/24)  <--veth-->  vbpfimp1 (10.200.0.2/24)  ns bpfimp-test
+#   host           vbpfimp0 (10.200.0.1/24, fd00:200::1/64)
+#                            <--veth-->
+#   ns bpfimp-test vbpfimp1 (10.200.0.2/24, fd00:200::2/64)
 #
 # Attach the XDP program to vbpfimp0 on the host; traffic generated from inside
 # the ns (e.g. via gen_traffic.sh) will arrive on vbpfimp0 and hit the program.
@@ -16,6 +18,8 @@ VETH_HOST="${VETH_HOST:-vbpfimp0}"
 VETH_NS="${VETH_NS:-vbpfimp1}"
 HOST_IP="${HOST_IP:-10.200.0.1/24}"
 NS_IP="${NS_IP:-10.200.0.2/24}"
+HOST_IP6="${HOST_IP6:-fd00:200::1/64}"
+NS_IP6="${NS_IP6:-fd00:200::2/64}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "must be run as root (try: sudo $0)" >&2
@@ -39,18 +43,28 @@ else
     ip link set "$VETH_NS" netns "$NS_NAME"
 fi
 
-log "configuring $HOST_IP on $VETH_HOST"
+# Make sure v6 is enabled on the veth pair (an earlier teardown/setup cycle
+# may have left disable_ipv6=1 in place).
+sysctl -qw "net.ipv6.conf.${VETH_HOST}.disable_ipv6=0" >/dev/null
+ip netns exec "$NS_NAME" sysctl -qw "net.ipv6.conf.${VETH_NS}.disable_ipv6=0" >/dev/null
+
+# We don't run a router in the harness, so no RAs arrive; turn off autoconf
+# anyway to keep the address state predictable across reboots and kernels.
+sysctl -qw "net.ipv6.conf.${VETH_HOST}.accept_ra=0" >/dev/null
+sysctl -qw "net.ipv6.conf.${VETH_HOST}.autoconf=0" >/dev/null
+ip netns exec "$NS_NAME" sysctl -qw "net.ipv6.conf.${VETH_NS}.accept_ra=0" >/dev/null
+ip netns exec "$NS_NAME" sysctl -qw "net.ipv6.conf.${VETH_NS}.autoconf=0" >/dev/null
+
+log "configuring $HOST_IP / $HOST_IP6 on $VETH_HOST"
 ip addr replace "$HOST_IP" dev "$VETH_HOST"
+ip -6 addr replace "$HOST_IP6" dev "$VETH_HOST" nodad
 ip link set "$VETH_HOST" up
 
-log "configuring $NS_IP on $VETH_NS (inside $NS_NAME)"
+log "configuring $NS_IP / $NS_IP6 on $VETH_NS (inside $NS_NAME)"
 ip -n "$NS_NAME" addr replace "$NS_IP" dev "$VETH_NS"
+ip -n "$NS_NAME" -6 addr replace "$NS_IP6" dev "$VETH_NS" nodad
 ip -n "$NS_NAME" link set lo up
 ip -n "$NS_NAME" link set "$VETH_NS" up
-
-# Disable IPv6 on the veth pair so the program (IPv4-only) doesn't see RA/NDP chatter.
-sysctl -qw "net.ipv6.conf.${VETH_HOST}.disable_ipv6=1" || true
-ip netns exec "$NS_NAME" sysctl -qw "net.ipv6.conf.${VETH_NS}.disable_ipv6=1" || true
 
 log "done"
 log ""
