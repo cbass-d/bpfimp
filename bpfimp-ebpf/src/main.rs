@@ -1,8 +1,6 @@
 #![no_std]
 #![no_main]
 
-const NS_PER_SEC: u64 = 1_000_000_000;
-
 use core::mem;
 
 use aya_ebpf::{
