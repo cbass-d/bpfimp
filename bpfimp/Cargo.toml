@@ -22,10 +22,6 @@ notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 nix = { version = "0.31.3", features = ["time"] }
 
-[dev-dependencies]
-cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
-
-
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

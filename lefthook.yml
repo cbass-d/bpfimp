@@ -1,0 +1,10 @@
+pre-commit:
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+
+pre-push:
+  commands:
+    clippy:
+      run: cargo clippy --workspace --exclude bpfimp-ebpf --all-targets -- -D warnings
