@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -50,11 +50,6 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read from {}", path.display()))?;
     let cfg: Config = toml::from_str(&raw)?;
-
-    let mut allowed_v4: HashMap<_, u32, Reputation> = HashMap::try_from(
-        ebpf.map_mut("ALLOWED_BUCKETS_V4")
-            .context("ALLOWED_BUCKETS_V4 map missing")?,
-    )?;
 
     let (allow_v4, allow_v6) = partition_list(&cfg.allowlist);
     let (block_v4, block_v6) = partition_list(&cfg.blocklist);
