@@ -9,7 +9,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{HashMap, LruHashMap},
+    maps::{LruHashMap, LruPerCpuHashMap},
     programs::XdpContext,
 };
 use aya_log_ebpf::{info, trace};
@@ -23,11 +23,12 @@ use network_types::{
 };
 
 #[map]
-static PACKET_COUNTS_V4: HashMap<u32, u64> = HashMap::<u32, u64>::with_max_entries(1024, 0);
+static PACKET_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
+    LruPerCpuHashMap::<u32, u64>::with_max_entries(1024, 0);
 
 #[map]
-static PACKET_COUNTS_V6: HashMap<[u8; 16], u64> =
-    HashMap::<[u8; 16], u64>::with_max_entries(1024, 0);
+static PACKET_COUNTS_V6: LruPerCpuHashMap<[u8; 16], u64> =
+    LruPerCpuHashMap::<[u8; 16], u64>::with_max_entries(1024, 0);
 
 #[map]
 static ALLOWED_BUCKETS_V4: LruHashMap<u32, Reputation> =
@@ -46,12 +47,12 @@ static BLOCKED_BUCKETS_V6: LruHashMap<[u8; 16], BlockedEntry> =
     LruHashMap::<[u8; 16], BlockedEntry>::with_max_entries(1024, 0);
 
 #[map]
-static UNKNOWN_BUCKETS_V4: LruHashMap<u32, TokenBucket> =
-    LruHashMap::<u32, TokenBucket>::with_max_entries(1024, 0);
+static UNKNOWN_BUCKETS_V4: LruPerCpuHashMap<u32, TokenBucket> =
+    LruPerCpuHashMap::<u32, TokenBucket>::with_max_entries(1024, 0);
 
 #[map]
-static UNKNOWN_BUCKETS_V6: LruHashMap<[u8; 16], TokenBucket> =
-    LruHashMap::<[u8; 16], TokenBucket>::with_max_entries(1024, 0);
+static UNKNOWN_BUCKETS_V6: LruPerCpuHashMap<[u8; 16], TokenBucket> =
+    LruPerCpuHashMap::<[u8; 16], TokenBucket>::with_max_entries(1024, 0);
 
 #[xdp]
 pub fn bpfimp(ctx: XdpContext) -> u32 {
@@ -72,30 +73,6 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     }
 
     Ok((start + offset) as *const T)
-}
-
-#[inline(always)]
-unsafe fn try_consume(
-    ctx: &XdpContext,
-    b: *mut TokenBucket,
-    max: u32,
-    refill_per_sec: u32,
-    now: u64,
-) -> bool {
-    let elapsed = (now - (*b).last_refill_ns) / NS_PER_SEC;
-    if elapsed >= 1 {
-        let add = (elapsed as u32).saturating_mul(refill_per_sec);
-        (*b).tokens = (*b).tokens.saturating_add(add).min(max);
-        (*b).last_refill_ns += elapsed * NS_PER_SEC;
-    }
-
-    if (*b).tokens == 0 {
-        return false;
-    }
-
-    (*b).tokens -= 1;
-
-    true
 }
 
 fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
@@ -130,7 +107,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     let allowed = unsafe {
         if let Some(rep) = ALLOWED_BUCKETS_V4.get_ptr_mut(&src_addr) {
             let is_ok = ((*rep).score >= MIN_SCORE_TO_PASS)
-                && try_consume(&ctx, &mut (*rep).bucket, MAX_TOKENS, REFILL_PER_SEC, now);
+                && (*rep).bucket.try_consume(MAX_TOKENS, REFILL_PER_SEC, now);
 
             if is_ok {
                 (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
@@ -141,7 +118,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
 
             is_ok
         } else if let Some(b) = UNKNOWN_BUCKETS_V4.get_ptr_mut(&src_addr) {
-            try_consume(&ctx, b, MAX_TOKENS, REFILL_PER_SEC, now)
+            (*b).try_consume(MAX_TOKENS, REFILL_PER_SEC, now)
         } else {
             let fresh = TokenBucket::new(now, true);
             let _ = UNKNOWN_BUCKETS_V4.insert(&src_addr, &fresh, 0);
@@ -184,7 +161,7 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
     let allowed = unsafe {
         if let Some(rep) = ALLOWED_BUCKETS_V6.get_ptr_mut(&src_addr) {
             let is_ok = (*rep).score >= MIN_SCORE_TO_PASS
-                && try_consume(&ctx, &mut (*rep).bucket, MAX_TOKENS, REFILL_PER_SEC, now);
+                && (*rep).bucket.try_consume(MAX_TOKENS, REFILL_PER_SEC, now);
 
             if is_ok {
                 (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
@@ -195,7 +172,7 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
 
             is_ok
         } else if let Some(b) = UNKNOWN_BUCKETS_V6.get_ptr_mut(&src_addr) {
-            try_consume(&ctx, b, MAX_TOKENS, REFILL_PER_SEC, now)
+            (*b).try_consume(MAX_TOKENS, REFILL_PER_SEC, now)
         } else {
             let fresh = TokenBucket::new(now, true);
             let _ = UNKNOWN_BUCKETS_V6.insert(&src_addr, &fresh, 0);
