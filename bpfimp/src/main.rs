@@ -124,11 +124,9 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to ALLOWED_V4 covert to HashMap")?;
 
         println!("=== ALLOWED_V4 ===");
-        for res in allowed_v4.iter() {
-            if let Ok((ip, rep)) = res {
-                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
-                println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
-            }
+        for (ip, rep) in allowed_v4.iter().flatten() {
+            let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
+            println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
         }
 
         let allowed_v6: HashMap<_, [u8; 16], Reputation> =
@@ -139,11 +137,9 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to ALLOWED_V6 covert to HashMap")?;
 
         println!("\n=== ALLOWED_V6 ===");
-        for res in allowed_v6.iter() {
-            if let Ok((ip, rep)) = res {
-                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
-                println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
-            }
+        for (ip, rep) in allowed_v6.iter().flatten() {
+            let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
+            println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
         }
 
         let blocked_v4: HashMap<_, u32, BlockedEntry> =
@@ -154,11 +150,9 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to BLOCKED_V4 covert to HashMap")?;
 
         println!("\n=== BLOCKED_V4 ===");
-        for res in blocked_v4.iter() {
-            if let Ok((ip, rep)) = res {
-                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
-                println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
-            }
+        for (ip, rep) in blocked_v4.iter().flatten() {
+            let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
+            println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
         }
 
         let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> =
@@ -169,11 +163,9 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to BLOCKED_V6 covert to HashMap")?;
 
         println!("\n=== BLOCKED_V6 ===");
-        for res in blocked_v6.iter() {
-            if let Ok((ip, rep)) = res {
-                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
-                println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
-            }
+        for (ip, rep) in blocked_v6.iter().flatten() {
+            let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
+            println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
         }
 
         return Ok(());
