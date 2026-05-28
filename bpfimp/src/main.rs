@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::{
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,7 +12,7 @@ use aya::{
     programs::{Xdp, XdpFlags},
 };
 use bpfimp_common::{BlockedEntry, Reputation};
-use clap::{Command, Parser, arg};
+use clap::{Command, arg};
 use log::info;
 use nix::time::{ClockId, clock_gettime};
 use notify::{
@@ -114,12 +114,69 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = cli().get_matches();
 
-    match cli.subcommand() {
-        Some(("inspect", _)) => {
-            println!("running inpspection command");
-            return Ok(());
+    if let Some(("inspect", _)) = cli.subcommand() {
+        println!("running inpspection command");
+        let allowed_v4: HashMap<_, u32, Reputation> =
+            HashMap::try_from(aya::maps::Map::LruHashMap(
+                aya::maps::MapData::from_pin("/sys/fs/bpf/ALLOWED_BUCKETS_V4")
+                    .context("failed to load ALLOWED_V4 pinned map")?,
+            ))
+            .context("failed to ALLOWED_V4 covert to HashMap")?;
+
+        println!("=== ALLOWED_V4 ===");
+        for res in allowed_v4.iter() {
+            if let Ok((ip, rep)) = res {
+                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
+                println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
+            }
         }
-        _ => {}
+
+        let allowed_v6: HashMap<_, [u8; 16], Reputation> =
+            HashMap::try_from(aya::maps::Map::LruHashMap(
+                aya::maps::MapData::from_pin("/sys/fs/bpf/ALLOWED_BUCKETS_V6")
+                    .context("failed to load ALLOWED_V6 pinned map")?,
+            ))
+            .context("failed to ALLOWED_V6 covert to HashMap")?;
+
+        println!("\n=== ALLOWED_V6 ===");
+        for res in allowed_v6.iter() {
+            if let Ok((ip, rep)) = res {
+                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
+                println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
+            }
+        }
+
+        let blocked_v4: HashMap<_, u32, BlockedEntry> =
+            HashMap::try_from(aya::maps::Map::LruHashMap(
+                aya::maps::MapData::from_pin("/sys/fs/bpf/BLOCKED_BUCKETS_V4")
+                    .context("failed to load BLOCKED_V4 pinned map")?,
+            ))
+            .context("failed to BLOCKED_V4 covert to HashMap")?;
+
+        println!("\n=== BLOCKED_V4 ===");
+        for res in blocked_v4.iter() {
+            if let Ok((ip, rep)) = res {
+                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
+                println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
+            }
+        }
+
+        let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> =
+            HashMap::try_from(aya::maps::Map::LruHashMap(
+                aya::maps::MapData::from_pin("/sys/fs/bpf/BLOCKED_BUCKETS_V6")
+                    .context("failed to load BLOCKED_V6 pinned map")?,
+            ))
+            .context("failed to BLOCKED_V6 covert to HashMap")?;
+
+        println!("\n=== BLOCKED_V6 ===");
+        for res in blocked_v6.iter() {
+            if let Ok((ip, rep)) = res {
+                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
+                println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
+            }
+        }
+
+        return Ok(());
     }
 
     let (iface, config) = if let Some((_, sub_matches)) = cli.subcommand() {
@@ -160,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
 
     let program: &mut Xdp = ebpf.program_mut("bpfimp").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, XdpFlags::default())
+    program.attach(iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
     info!("attached to the {} interface", iface);
 
@@ -175,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
     debouncer.watch(parent, RecursiveMode::NonRecursive)?;
 
     // Initial load of config
-    match load_config_lists(&mut ebpf, &config) {
+    match load_config_lists(&mut ebpf, config) {
         Ok((n, m)) => info!(
             "loaded {n} allowed ips and {m} blocked ips from {}",
             config.display()
@@ -193,11 +250,11 @@ async fn main() -> anyhow::Result<()> {
             Some(Ok(events)) = rx.recv() => {
                 let is_config_save = |e: &DebouncedEvent| {
                     matches!(e.kind, EventKind::Access(AccessKind::Close(AccessMode::Write)))
-                    && e.paths.iter().any(|p| p.ends_with(&config))
+                    && e.paths.iter().any(|p| p.ends_with(config))
                 };
 
                 if events.iter().any(is_config_save) {
-                    match load_config_lists(&mut ebpf, &config) {
+                    match load_config_lists(&mut ebpf, config) {
                         Ok((n, m)) => info!("loaded {n} allowed ips and {m} blocked ips from {}", config.display()),
                         Err(e) => warn!("peers reload failed: {e:#}"),
                     }

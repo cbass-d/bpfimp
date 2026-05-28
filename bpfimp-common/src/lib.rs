@@ -9,7 +9,7 @@ pub const PENALTY: u32 = 10;
 const NS_PER_SEC: u64 = 1_000_000_000;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct TokenBucket {
     pub tokens: u32,
     pub last_refill_ns: u64,
@@ -41,7 +41,7 @@ impl TokenBucket {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Reputation {
     pub bucket: TokenBucket,
     pub score: u32,
@@ -57,7 +57,7 @@ impl Reputation {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct BlockedEntry {
     pub hits: u64,
     pub last_seen_ns: u64,
