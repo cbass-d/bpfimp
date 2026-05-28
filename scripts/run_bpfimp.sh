@@ -20,5 +20,6 @@ cargo build --release
 
 echo "[run] attaching bpfimp to $VETH_HOST (peers=$PEERS_CONFIG)"
 sudo RUST_LOG="$RUST_LOG" ./target/release/bpfimp \
+    run \
     --iface "$VETH_HOST" \
     --config "$PEERS_CONFIG"

@@ -12,7 +12,7 @@ use aya::{
     programs::{Xdp, XdpFlags},
 };
 use bpfimp_common::{BlockedEntry, Reputation};
-use clap::Parser;
+use clap::{Command, Parser, arg};
 use log::info;
 use nix::time::{ClockId, clock_gettime};
 use notify::{
@@ -25,14 +25,6 @@ use tokio::sync::mpsc;
 use log::{debug, warn};
 use tokio::signal;
 
-#[derive(Debug, Parser)]
-struct Opts {
-    #[clap(short, long, default_value = "wlan0")]
-    iface: String,
-    #[clap(short, long, default_value = "bpfimp.toml")]
-    config: PathBuf,
-}
-
 #[derive(serde::Deserialize)]
 struct Config {
     #[serde(default)]
@@ -44,6 +36,23 @@ fn clock_now_ns() -> u64 {
     let ts = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC get time failed");
 
     (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64
+}
+
+fn cli() -> Command {
+    Command::new("bpfimp")
+        .about("")
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("run")
+                .about("run the binary")
+                .arg(arg!(-i --iface <IFACE> "the interface to attach to").default_value("wlan0"))
+                .arg(
+                    arg!(-c --config <CONFIG> "path to config file")
+                        .default_value("bpfimp.toml")
+                        .value_parser(clap::value_parser!(PathBuf)),
+                ),
+        )
+        .subcommand(Command::new("inspect").about("inspect bpf data persisted over runs"))
 }
 
 fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
@@ -101,9 +110,29 @@ fn partition_list(list: &[String]) -> (Vec<u32>, Vec<[u8; 16]>) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opts::parse();
-
     env_logger::init();
+
+    let cli = cli().get_matches();
+
+    match cli.subcommand() {
+        Some(("inspect", _)) => {
+            println!("running inpspection command");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let (iface, config) = if let Some((_, sub_matches)) = cli.subcommand() {
+        (
+            sub_matches
+                .get_one::<String>("iface")
+                .map(|s| s.as_str())
+                .unwrap(),
+            sub_matches.get_one::<PathBuf>("config").unwrap(),
+        )
+    } else {
+        return Ok(());
+    };
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -129,7 +158,6 @@ async fn main() -> anyhow::Result<()> {
         warn!("failed to initialize eBPF logger: {e}");
     }
 
-    let Opts { iface, config } = opt;
     let program: &mut Xdp = ebpf.program_mut("bpfimp").unwrap().try_into()?;
     program.load()?;
     program.attach(&iface, XdpFlags::default())
