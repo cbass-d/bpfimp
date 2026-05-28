@@ -21,28 +21,27 @@ use network_types::{
 };
 
 #[map]
-static PACKET_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
-    LruPerCpuHashMap::<u32, u64>::with_max_entries(1024, 0);
+static PACKET_COUNTS_V4: LruPerCpuHashMap<u32, u64> = LruPerCpuHashMap::<u32, u64>::pinned(1024, 0);
 
 #[map]
 static PACKET_COUNTS_V6: LruPerCpuHashMap<[u8; 16], u64> =
-    LruPerCpuHashMap::<[u8; 16], u64>::with_max_entries(1024, 0);
+    LruPerCpuHashMap::<[u8; 16], u64>::pinned(1024, 0);
 
 #[map]
 static ALLOWED_BUCKETS_V4: LruHashMap<u32, Reputation> =
-    LruHashMap::<u32, Reputation>::with_max_entries(1024, 0);
+    LruHashMap::<u32, Reputation>::pinned(1024, 0);
 
 #[map]
 static ALLOWED_BUCKETS_V6: LruHashMap<[u8; 16], Reputation> =
-    LruHashMap::<[u8; 16], Reputation>::with_max_entries(1024, 0);
+    LruHashMap::<[u8; 16], Reputation>::pinned(1024, 0);
 
 #[map]
 static BLOCKED_BUCKETS_V4: LruHashMap<u32, BlockedEntry> =
-    LruHashMap::<u32, BlockedEntry>::with_max_entries(1024, 0);
+    LruHashMap::<u32, BlockedEntry>::pinned(1024, 0);
 
 #[map]
 static BLOCKED_BUCKETS_V6: LruHashMap<[u8; 16], BlockedEntry> =
-    LruHashMap::<[u8; 16], BlockedEntry>::with_max_entries(1024, 0);
+    LruHashMap::<[u8; 16], BlockedEntry>::pinned(1024, 0);
 
 #[map]
 static UNKNOWN_BUCKETS_V4: LruPerCpuHashMap<u32, TokenBucket> =
@@ -78,7 +77,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     let src_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
 
     if let Some(entry) = BLOCKED_BUCKETS_V4.get_ptr_mut(&src_addr) {
-        trace!(&ctx, "packet from blocked ip");
+        trace!(ctx, "packet from blocked ip");
 
         unsafe {
             (*entry).hits += 1;
@@ -92,11 +91,11 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
         match PACKET_COUNTS_V4.get_ptr_mut(&src_addr) {
             Some(counter) => {
                 *counter += 1;
-                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
+                trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
             }
             None => {
                 let _ = PACKET_COUNTS_V4.insert(&src_addr, &1, 1);
-                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
+                trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
             }
         }
     }
@@ -110,7 +109,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
             if is_ok {
                 (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
             } else {
-                info!(&ctx, "IP: {} penalized", src_addr);
+                info!(ctx, "IP: {} penalized", src_addr);
                 (*rep).score = (*rep).score.saturating_sub(PENALTY);
             }
 
@@ -132,7 +131,7 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
     let src_addr = unsafe { (*ipv6hdr).src_addr };
 
     if let Some(entry) = BLOCKED_BUCKETS_V6.get_ptr_mut(&src_addr) {
-        trace!(&ctx, "packet from blocked ip");
+        trace!(ctx, "packet from blocked ip");
 
         unsafe {
             (*entry).hits += 1;
@@ -146,11 +145,11 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
         match PACKET_COUNTS_V6.get_ptr_mut(&src_addr) {
             Some(counter) => {
                 *counter += 1;
-                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
+                trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
             }
             None => {
                 let _ = PACKET_COUNTS_V6.insert(&src_addr, &1, 1);
-                trace!(&ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
+                trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
             }
         }
     }
@@ -164,7 +163,7 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
             if is_ok {
                 (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
             } else {
-                info!(&ctx, "IPv6 {:i} penalized", src_addr);
+                info!(ctx, "IPv6 {:i} penalized", src_addr);
                 (*rep).score = (*rep).score.saturating_sub(PENALTY);
             }
 
