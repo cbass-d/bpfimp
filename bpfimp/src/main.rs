@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::Context as _;
 use aya::{
-    Ebpf,
-    maps::HashMap,
+    Ebpf, EbpfLoader, Pod,
+    maps::{HashMap, Map, MapData},
     programs::{Xdp, XdpFlags},
 };
 use bpfimp_common::{BlockedEntry, Reputation};
@@ -24,6 +24,8 @@ use tokio::sync::mpsc;
 #[rustfmt::skip]
 use log::{debug, warn};
 use tokio::signal;
+
+const BPFS_FS_PATH: &str = "/sys/fs/bpf/bpfimp";
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -55,6 +57,14 @@ fn cli() -> Command {
         .subcommand(Command::new("inspect").about("inspect bpf data persisted over runs"))
 }
 
+fn load_map<K: Pod, V: Pod>(path: &str) -> Result<HashMap<MapData, K, V>> {
+    let data =
+        MapData::from_pin(path).with_context(|| format!("failed to open pinned map at: {path}"))?;
+
+    HashMap::try_from(Map::LruHashMap(data))
+        .with_context(|| format!("type mismatch opening: {path}"))
+}
+
 fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read from {}", path.display()))?;
@@ -67,27 +77,55 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
 
     let mut m: HashMap<_, u32, Reputation> =
         HashMap::try_from(ebpf.map_mut("ALLOWED_BUCKETS_V4").context("missing")?)?;
-    for k in &allow_v4 {
-        m.insert(k, Reputation::new(now), 0)?;
-    }
+
+    let current_keys: Vec<u32> = m.iter().flatten().map(|(k, _)| k).collect();
+    allow_v4
+        .iter()
+        .filter(|ip| !current_keys.contains(ip))
+        .for_each(|ip| {
+            if let Err(_) = m.insert(ip, Reputation::new(now), 0) {
+                warn!("failed to insert entry into ALLOWED_V6 map");
+            }
+        });
 
     let mut m: HashMap<_, [u8; 16], Reputation> =
         HashMap::try_from(ebpf.map_mut("ALLOWED_BUCKETS_V6").context("missing")?)?;
-    for k in &allow_v6 {
-        m.insert(k, Reputation::new(now), 0)?;
-    }
+
+    let current_keys: Vec<[u8; 16]> = m.iter().flatten().map(|(k, _)| k).collect();
+    allow_v6
+        .iter()
+        .filter(|ip| !current_keys.contains(ip))
+        .for_each(|ip| {
+            if let Err(_) = m.insert(ip, Reputation::new(now), 0) {
+                warn!("failed to insert entry into ALLOWED_V4 map");
+            }
+        });
 
     let mut m: HashMap<_, u32, BlockedEntry> =
         HashMap::try_from(ebpf.map_mut("BLOCKED_BUCKETS_V4").context("missing")?)?;
-    for k in &block_v4 {
-        m.insert(k, BlockedEntry::default(), 0)?;
-    }
+
+    let current_keys: Vec<u32> = m.iter().flatten().map(|(k, _)| k).collect();
+    block_v4
+        .iter()
+        .filter(|ip| !current_keys.contains(ip))
+        .for_each(|ip| {
+            if let Err(_) = m.insert(ip, BlockedEntry::default(), 0) {
+                warn!("failed to insert entry into BLOCKED_V4 map");
+            }
+        });
 
     let mut m: HashMap<_, [u8; 16], BlockedEntry> =
         HashMap::try_from(ebpf.map_mut("BLOCKED_BUCKETS_V6").context("missing")?)?;
-    for k in &block_v6 {
-        m.insert(k, BlockedEntry::default(), 0)?;
-    }
+
+    let current_keys: Vec<[u8; 16]> = m.iter().flatten().map(|(k, _)| k).collect();
+    block_v6
+        .iter()
+        .filter(|ip| !current_keys.contains(ip))
+        .for_each(|ip| {
+            if let Err(_) = m.insert(ip, BlockedEntry::default(), 0) {
+                warn!("failed to insert entry into BLOCKED_V6 map");
+            }
+        });
 
     Ok((
         allow_v4.len() + allow_v6.len(),
@@ -115,10 +153,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli().get_matches();
 
     if let Some(("inspect", _)) = cli.subcommand() {
-        println!("running inpspection command");
+        debug!("running inpspection command");
         let allowed_v4: HashMap<_, u32, Reputation> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/ALLOWED_BUCKETS_V4")
+                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/ALLOWED_BUCKETS_V4")
                     .context("failed to load ALLOWED_V4 pinned map")?,
             ))
             .context("failed to ALLOWED_V4 covert to HashMap")?;
@@ -131,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
 
         let allowed_v6: HashMap<_, [u8; 16], Reputation> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/ALLOWED_BUCKETS_V6")
+                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/ALLOWED_BUCKETS_V6")
                     .context("failed to load ALLOWED_V6 pinned map")?,
             ))
             .context("failed to ALLOWED_V6 covert to HashMap")?;
@@ -144,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
 
         let blocked_v4: HashMap<_, u32, BlockedEntry> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/BLOCKED_BUCKETS_V4")
+                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/BLOCKED_BUCKETS_V4")
                     .context("failed to load BLOCKED_V4 pinned map")?,
             ))
             .context("failed to BLOCKED_V4 covert to HashMap")?;
@@ -157,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
 
         let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/BLOCKED_BUCKETS_V6")
+                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/BLOCKED_BUCKETS_V6")
                     .context("failed to load BLOCKED_V6 pinned map")?,
             ))
             .context("failed to BLOCKED_V6 covert to HashMap")?;
@@ -198,10 +236,13 @@ async fn main() -> anyhow::Result<()> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/bpfimp"
-    )))?;
+    let mut ebpf =
+        EbpfLoader::new()
+            .map_pin_path("/sys/fs/bpf/bpfimp")
+            .load(aya::include_bytes_aligned!(concat!(
+                env!("OUT_DIR"),
+                "/bpfimp"
+            )))?;
 
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
         warn!("failed to initialize eBPF logger: {e}");
