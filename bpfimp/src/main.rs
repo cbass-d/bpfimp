@@ -75,7 +75,7 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
         .iter()
         .filter(|ip| !current_keys.contains(ip))
         .for_each(|ip| {
-            if let Err(_) = m.insert(ip, Reputation::new(now), 0) {
+            if m.insert(ip, Reputation::new(now), 0).is_err() {
                 warn!("failed to insert entry into ALLOWED_V6 map");
             }
         });
@@ -88,7 +88,7 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
         .iter()
         .filter(|ip| !current_keys.contains(ip))
         .for_each(|ip| {
-            if let Err(_) = m.insert(ip, Reputation::new(now), 0) {
+            if m.insert(ip, Reputation::new(now), 0).is_err() {
                 warn!("failed to insert entry into ALLOWED_V4 map");
             }
         });
@@ -101,7 +101,7 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
         .iter()
         .filter(|ip| !current_keys.contains(ip))
         .for_each(|ip| {
-            if let Err(_) = m.insert(ip, BlockedEntry::default(), 0) {
+            if m.insert(ip, BlockedEntry::default(), 0).is_err() {
                 warn!("failed to insert entry into BLOCKED_V4 map");
             }
         });
@@ -114,7 +114,7 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
         .iter()
         .filter(|ip| !current_keys.contains(ip))
         .for_each(|ip| {
-            if let Err(_) = m.insert(ip, BlockedEntry::default(), 0) {
+            if m.insert(ip, BlockedEntry::default(), 0).is_err() {
                 warn!("failed to insert entry into BLOCKED_V6 map");
             }
         });
