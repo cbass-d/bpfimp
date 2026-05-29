@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::Context as _;
 use aya::{
-    Ebpf, EbpfLoader, Pod,
-    maps::{HashMap, Map, MapData},
+    Ebpf, EbpfLoader,
+    maps::HashMap,
     programs::{Xdp, XdpFlags},
 };
 use bpfimp_common::{BlockedEntry, Reputation};
@@ -55,14 +55,6 @@ fn cli() -> Command {
                 ),
         )
         .subcommand(Command::new("inspect").about("inspect bpf data persisted over runs"))
-}
-
-fn load_map<K: Pod, V: Pod>(path: &str) -> Result<HashMap<MapData, K, V>> {
-    let data =
-        MapData::from_pin(path).with_context(|| format!("failed to open pinned map at: {path}"))?;
-
-    HashMap::try_from(Map::LruHashMap(data))
-        .with_context(|| format!("type mismatch opening: {path}"))
 }
 
 fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
@@ -156,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         debug!("running inpspection command");
         let allowed_v4: HashMap<_, u32, Reputation> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/ALLOWED_BUCKETS_V4")
+                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V4"))
                     .context("failed to load ALLOWED_V4 pinned map")?,
             ))
             .context("failed to ALLOWED_V4 covert to HashMap")?;
@@ -169,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
 
         let allowed_v6: HashMap<_, [u8; 16], Reputation> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/ALLOWED_BUCKETS_V6")
+                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V6"))
                     .context("failed to load ALLOWED_V6 pinned map")?,
             ))
             .context("failed to ALLOWED_V6 covert to HashMap")?;
@@ -182,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
 
         let blocked_v4: HashMap<_, u32, BlockedEntry> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/BLOCKED_BUCKETS_V4")
+                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V4"))
                     .context("failed to load BLOCKED_V4 pinned map")?,
             ))
             .context("failed to BLOCKED_V4 covert to HashMap")?;
@@ -195,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
 
         let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> =
             HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin("/sys/fs/bpf/bpfimp/BLOCKED_BUCKETS_V6")
+                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V6"))
                     .context("failed to load BLOCKED_V6 pinned map")?,
             ))
             .context("failed to BLOCKED_V6 covert to HashMap")?;
