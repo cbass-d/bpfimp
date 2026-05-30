@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::{
+    collections::HashSet,
+    hash::Hash,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::Duration,
@@ -7,8 +9,8 @@ use std::{
 
 use anyhow::Context as _;
 use aya::{
-    Ebpf, EbpfLoader,
-    maps::HashMap,
+    Ebpf, EbpfLoader, Pod,
+    maps::{HashMap, MapData},
     programs::{Xdp, XdpFlags},
 };
 use bpfimp_common::{BlockedEntry, Reputation};
@@ -57,6 +59,29 @@ fn cli() -> Command {
         .subcommand(Command::new("inspect").about("inspect bpf data persisted over runs"))
 }
 
+/// Sync the keys in maps using the `desired` hashset
+fn sync_keys<K, V>(
+    map: &mut HashMap<&mut MapData, K, V>,
+    desired: &HashSet<K>,
+    make_value: impl Fn(&K) -> V,
+) -> Result<()>
+where
+    K: Pod + Eq + Hash + Copy,
+    V: Pod,
+{
+    let current: HashSet<K> = map.keys().filter_map(|k| k.ok()).collect();
+
+    for k in current.difference(desired) {
+        map.remove(k)?;
+    }
+
+    for k in desired.difference(&current) {
+        map.insert(k, make_value(k), 0)?;
+    }
+
+    Ok(())
+}
+
 fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read from {}", path.display()))?;
@@ -64,65 +89,40 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
 
     let (allow_v4, allow_v6) = partition_list(&cfg.allowlist);
     let (block_v4, block_v6) = partition_list(&cfg.blocklist);
-
     let now = clock_now_ns();
 
-    let mut m: HashMap<_, u32, Reputation> =
-        HashMap::try_from(ebpf.map_mut("ALLOWED_BUCKETS_V4").context("missing")?)?;
+    let allow_v4: HashSet<u32> = allow_v4.into_iter().collect();
+    let allow_v6: HashSet<[u8; 16]> = allow_v6.into_iter().collect();
+    let block_v4: HashSet<u32> = block_v4.into_iter().collect();
+    let block_v6: HashSet<[u8; 16]> = block_v6.into_iter().collect();
 
-    let current_keys: Vec<u32> = m.iter().flatten().map(|(k, _)| k).collect();
-    allow_v4
-        .iter()
-        .filter(|ip| !current_keys.contains(ip))
-        .for_each(|ip| {
-            if m.insert(ip, Reputation::new(now), 0).is_err() {
-                warn!("failed to insert entry into ALLOWED_V6 map");
-            }
-        });
-
-    let mut m: HashMap<_, [u8; 16], Reputation> =
-        HashMap::try_from(ebpf.map_mut("ALLOWED_BUCKETS_V6").context("missing")?)?;
-
-    let current_keys: Vec<[u8; 16]> = m.iter().flatten().map(|(k, _)| k).collect();
-    allow_v6
-        .iter()
-        .filter(|ip| !current_keys.contains(ip))
-        .for_each(|ip| {
-            if m.insert(ip, Reputation::new(now), 0).is_err() {
-                warn!("failed to insert entry into ALLOWED_V4 map");
-            }
-        });
-
-    let mut m: HashMap<_, u32, BlockedEntry> =
-        HashMap::try_from(ebpf.map_mut("BLOCKED_BUCKETS_V4").context("missing")?)?;
-
-    let current_keys: Vec<u32> = m.iter().flatten().map(|(k, _)| k).collect();
-    block_v4
-        .iter()
-        .filter(|ip| !current_keys.contains(ip))
-        .for_each(|ip| {
-            if m.insert(ip, BlockedEntry::default(), 0).is_err() {
-                warn!("failed to insert entry into BLOCKED_V4 map");
-            }
-        });
-
-    let mut m: HashMap<_, [u8; 16], BlockedEntry> =
-        HashMap::try_from(ebpf.map_mut("BLOCKED_BUCKETS_V6").context("missing")?)?;
-
-    let current_keys: Vec<[u8; 16]> = m.iter().flatten().map(|(k, _)| k).collect();
-    block_v6
-        .iter()
-        .filter(|ip| !current_keys.contains(ip))
-        .for_each(|ip| {
-            if m.insert(ip, BlockedEntry::default(), 0).is_err() {
-                warn!("failed to insert entry into BLOCKED_V6 map");
-            }
-        });
+    sync_keys(&mut map_of(ebpf, "ALLOWED_BUCKETS_V4")?, &allow_v4, |_| {
+        Reputation::new(now)
+    })?;
+    sync_keys(&mut map_of(ebpf, "ALLOWED_BUCKETS_V6")?, &allow_v6, |_| {
+        Reputation::new(now)
+    })?;
+    sync_keys(&mut map_of(ebpf, "BLOCKED_BUCKETS_V4")?, &block_v4, |_| {
+        BlockedEntry::default()
+    })?;
+    sync_keys(&mut map_of(ebpf, "BLOCKED_BUCKETS_V6")?, &block_v6, |_| {
+        BlockedEntry::default()
+    })?;
 
     Ok((
         allow_v4.len() + allow_v6.len(),
         block_v4.len() + block_v6.len(),
     ))
+}
+
+fn map_of<'a, K: Pod, V: Pod>(
+    ebpf: &'a mut Ebpf,
+    name: &str,
+) -> Result<HashMap<&'a mut MapData, K, V>> {
+    Ok(HashMap::try_from(
+        ebpf.map_mut(name)
+            .with_context(|| format!("map {name} not found"))?,
+    )?)
 }
 
 fn partition_list(list: &[String]) -> (Vec<u32>, Vec<[u8; 16]>) {
