@@ -21,11 +21,12 @@ use network_types::{
 };
 
 #[map]
-static PACKET_COUNTS_V4: LruPerCpuHashMap<u32, u64> = LruPerCpuHashMap::<u32, u64>::pinned(1024, 0);
+static PACKET_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
+    LruPerCpuHashMap::<u32, u64>::with_max_entries(1024, 0);
 
 #[map]
 static PACKET_COUNTS_V6: LruPerCpuHashMap<[u8; 16], u64> =
-    LruPerCpuHashMap::<[u8; 16], u64>::pinned(1024, 0);
+    LruPerCpuHashMap::<[u8; 16], u64>::with_max_entries(1024, 0);
 
 #[map]
 static ALLOWED_BUCKETS_V4: LruHashMap<u32, Reputation> =
