@@ -25,7 +25,7 @@ program:
      packets nudge the score up (capped at `MAX_SCORE`); a denied packet
      subtracts `PENALTY`. This lets a trusted peer absorb a burst but get
      throttled if it sustains abuse.
-   - **Unknown IPs** (`UKNOWN_BUCKETS_V4` / `UKNOWN_BUCKETS_V6`) —
+   - **Unknown IPs** (`UNKNOWN_BUCKETS_V4` / `UNKNOWN_BUCKETS_V6`) —
      auto-inserted with a smaller starting balance (`NEW_MAX_TOKENS`) and a
      plain token bucket.
 4. Returns `XDP_PASS` or `XDP_DROP` based on the result.
@@ -52,7 +52,7 @@ without a restart.
         │                 |    │
         ▼                 |    │
    ALLOWED_BUCKETS_V{4,6} ◄──|─┘
-   UKNOWN_BUCKETS_V{4,6}  |
+   UNKNOWN_BUCKETS_V{4,6} |
         │                 |
         ▼                 |
    XDP_PASS / XDP_DROP    |
@@ -62,6 +62,23 @@ The three crates split cleanly: `bpfimp-ebpf` is the `no_std` kernel program,
 `bpfimp` is the Tokio-based loader, and `bpfimp-common` holds the POD types
 (`TokenBucket`, `Reputation`, `BlockedEntry`) and policy constants shared by
 both sides.
+
+## Persistence
+
+The maps are pinned to bpffs under `/sys/fs/bpf/bpfimp/`. The loader declares
+them with `pinned(...)` on the kernel side and opens them through
+`EbpfLoader::map_pin_path("/sys/fs/bpf/bpfimp")`, so on startup it reuses an
+existing pin when one is present and creates+pins a fresh map otherwise. As a
+result reputation scores, block-hit counters, and per-IP packet totals survive
+a `bpfimp run` restart — they are *not* zeroed on reload.
+
+`bpfimp inspect` reads those pinned maps directly without loading or attaching
+the eBPF program, so you can dump the persisted state at any time (even while
+`bpfimp run` is not active). To wipe the state, remove the pins:
+
+```shell
+sudo rm -rf /sys/fs/bpf/bpfimp
+```
 
 ## Quickstart
 
@@ -116,8 +133,10 @@ blocklist = [
 ```
 
 Edits are picked up live — the userspace watcher debounces filesystem events
-and re-pushes both lists into the kernel maps on save. Removed IPs naturally
-age out via the LRU maps.
+and reconciles both lists against the kernel maps on save. The reconcile is a
+set diff: IPs removed from the file are deleted from their map, newly-added IPs
+are inserted, and IPs that are still listed are left untouched — so an allowed
+peer keeps its accumulated reputation across edits instead of being reset.
 
 ## Policy knobs
 
@@ -139,18 +158,28 @@ unknown IP's bucket; an allowed peer with a healthy score absorbs bursts up to
 
 ## CLI
 
+`bpfimp` is subcommand-based:
+
 ```
-bpfimp --iface <NAME> [--config <PATH>]
+bpfimp run [--iface <NAME>] [--config <PATH>]
 
   -i, --iface   interface to attach XDP to (default: wlan0)
   -c, --config  path to bpfimp.toml (default: ./bpfimp.toml)
+
+bpfimp inspect
 ```
+
+- **`run`** loads and attaches the XDP program, then watches the config file
+  and reconciles the allow/block lists on every save.
+- **`inspect`** reads the pinned maps under `/sys/fs/bpf/bpfimp/` and prints the
+  current allowed-peer reputation scores and blocked-IP hit counts. It does not
+  load or attach the program, so it works whether or not `run` is active (as
+  long as the pins exist from a prior `run`).
 
 `RUST_LOG=info` (or `debug`/`trace`) controls log verbosity.
 
 ## Limitations
 
-- **No persistent counters.** Maps are zeroed on program reload.
 - **Reputation doesn't decay over time** — a penalized IP that goes silent
   stays penalized until evicted from the LRU map.
 - **v4 and v6 of the same peer are tracked independently** — no cross-family
