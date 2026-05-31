@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::{
     collections::HashSet,
+    fs::DirBuilder,
     hash::Hash,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
@@ -388,6 +389,16 @@ async fn main() -> anyhow::Result<()> {
         }
 
         return Ok(());
+    }
+
+    // Check if the '/sys/fs/bpf/bpfimp' directory exists,
+    // if not create it
+    let path = Path::new("/sys/fs/bpf/bpfimp");
+    if !path.exists() {
+        DirBuilder::new()
+            .recursive(true)
+            .create(path)
+            .with_context(|| "failed to create bpfimp map directory")?;
     }
 
     let (iface, config) = if let Some((_, sub_matches)) = cli.subcommand() {
