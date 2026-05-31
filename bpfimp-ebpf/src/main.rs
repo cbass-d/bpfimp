@@ -21,11 +21,11 @@ use network_types::{
 };
 
 #[map]
-static PACKET_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
+static PKT_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
     LruPerCpuHashMap::<u32, u64>::with_max_entries(1024, 0);
 
 #[map]
-static PACKET_COUNTS_V6: LruPerCpuHashMap<[u8; 16], u64> =
+static PKT_COUNTS_V6: LruPerCpuHashMap<[u8; 16], u64> =
     LruPerCpuHashMap::<[u8; 16], u64>::with_max_entries(1024, 0);
 
 #[map]
@@ -45,12 +45,12 @@ static BLOCKED_BUCKETS_V6: LruHashMap<[u8; 16], BlockedEntry> =
     LruHashMap::<[u8; 16], BlockedEntry>::pinned(1024, 0);
 
 #[map]
-static UNKNOWN_BUCKETS_V4: LruPerCpuHashMap<u32, TokenBucket> =
-    LruPerCpuHashMap::<u32, TokenBucket>::with_max_entries(1024, 0);
+static UNK_BKTS_V4: LruHashMap<u32, TokenBucket> =
+    LruHashMap::<u32, TokenBucket>::with_max_entries(1024, 0);
 
 #[map]
-static UNKNOWN_BUCKETS_V6: LruPerCpuHashMap<[u8; 16], TokenBucket> =
-    LruPerCpuHashMap::<[u8; 16], TokenBucket>::with_max_entries(1024, 0);
+static UNK_BKTS_V6: LruHashMap<[u8; 16], TokenBucket> =
+    LruHashMap::<[u8; 16], TokenBucket>::with_max_entries(1024, 0);
 
 #[xdp]
 pub fn bpfimp(ctx: XdpContext) -> u32 {
@@ -89,13 +89,13 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     }
 
     unsafe {
-        match PACKET_COUNTS_V4.get_ptr_mut(&src_addr) {
+        match PKT_COUNTS_V4.get_ptr_mut(&src_addr) {
             Some(counter) => {
                 *counter += 1;
                 trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
             }
             None => {
-                let _ = PACKET_COUNTS_V4.insert(&src_addr, &1, 1);
+                let _ = PKT_COUNTS_V4.insert(&src_addr, &1, 1);
                 trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
             }
         }
@@ -115,11 +115,11 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
             }
 
             is_ok
-        } else if let Some(b) = UNKNOWN_BUCKETS_V4.get_ptr_mut(&src_addr) {
+        } else if let Some(b) = UNK_BKTS_V4.get_ptr_mut(&src_addr) {
             (*b).try_consume(MAX_TOKENS, REFILL_PER_SEC, now)
         } else {
             let fresh = TokenBucket::new(now, true);
-            let _ = UNKNOWN_BUCKETS_V4.insert(&src_addr, &fresh, 0);
+            let _ = UNK_BKTS_V4.insert(&src_addr, &fresh, 0);
             true
         }
     };
@@ -143,13 +143,13 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
     }
 
     unsafe {
-        match PACKET_COUNTS_V6.get_ptr_mut(&src_addr) {
+        match PKT_COUNTS_V6.get_ptr_mut(&src_addr) {
             Some(counter) => {
                 *counter += 1;
                 trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, *counter);
             }
             None => {
-                let _ = PACKET_COUNTS_V6.insert(&src_addr, &1, 1);
+                let _ = PKT_COUNTS_V6.insert(&src_addr, &1, 1);
                 trace!(ctx, "SRC IP: {:i}, total: {}", src_addr, 1);
             }
         }
@@ -169,11 +169,11 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
             }
 
             is_ok
-        } else if let Some(b) = UNKNOWN_BUCKETS_V6.get_ptr_mut(&src_addr) {
+        } else if let Some(b) = UNK_BKTS_V6.get_ptr_mut(&src_addr) {
             (*b).try_consume(MAX_TOKENS, REFILL_PER_SEC, now)
         } else {
             let fresh = TokenBucket::new(now, true);
-            let _ = UNKNOWN_BUCKETS_V6.insert(&src_addr, &fresh, 0);
+            let _ = UNK_BKTS_V6.insert(&src_addr, &fresh, 0);
             true
         }
     };

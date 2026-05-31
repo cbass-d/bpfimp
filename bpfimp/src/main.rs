@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use libc::priority_t;
 use std::{
     collections::HashSet,
     hash::Hash,
@@ -10,12 +11,12 @@ use std::{
 use anyhow::Context as _;
 use aya::{
     Ebpf, EbpfLoader, Pod,
-    maps::{HashMap, MapData},
+    maps::{HashMap, Map, MapData, PerCpuHashMap, loaded_maps},
     programs::{Xdp, XdpFlags},
 };
-use bpfimp_common::{BlockedEntry, Reputation};
+use bpfimp_common::{BlockedEntry, Reputation, TokenBucket};
 use clap::{Command, arg};
-use log::info;
+use log::{error, info};
 use nix::time::{ClockId, clock_gettime};
 use notify::{
     EventKind, RecursiveMode,
@@ -115,6 +116,8 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     ))
 }
 
+/// Returns an `aya::maps::HashMap` with the name provided if one
+/// exists
 fn map_of<'a, K: Pod, V: Pod>(
     ebpf: &'a mut Ebpf,
     name: &str,
@@ -123,6 +126,57 @@ fn map_of<'a, K: Pod, V: Pod>(
         ebpf.map_mut(name)
             .with_context(|| format!("map {name} not found"))?,
     )?)
+}
+
+/// Returns an `aya::maps::PerCpuHashMap` with the name provided if one
+/// exists
+fn percpu_map_of<'a, K: Pod, V: Pod>(
+    ebpf: &'a mut Ebpf,
+    name: &str,
+) -> Result<PerCpuHashMap<&'a mut MapData, K, V>> {
+    Ok(PerCpuHashMap::try_from(
+        ebpf.map_mut(name)
+            .with_context(|| format!("map {name} not found"))?,
+    )?)
+}
+
+/// Return the per cpu map using 'loaded_maps()' if it exists on the host
+/// system
+fn load_percpu_map<K: Pod, V: Pod>(
+    name: &str,
+    key_size: u32,
+) -> Result<PerCpuHashMap<MapData, K, V>> {
+    debug!("loading map: {name}");
+    let info = loaded_maps()
+        .filter_map(|m| m.ok())
+        .find(|m| m.name_as_str() == Some(name) && m.key_size() == key_size)
+        .with_context(|| format!("failed to get map info for: {name}"))?;
+
+    let map_data = aya::maps::MapData::from_id(info.id())
+        .with_context(|| format!("failed to get map data: {name}"))?;
+
+    let map: PerCpuHashMap<_, K, V> = PerCpuHashMap::try_from(Map::PerCpuLruHashMap(map_data))
+        .with_context(|| format!("failed to convert LRU HashMap: {name}"))?;
+
+    Ok(map)
+}
+
+/// Return the map using 'loaded_maps()' if it exists on the host
+/// system
+fn load_map<K: Pod, V: Pod>(name: &str, key_size: u32) -> Result<HashMap<MapData, K, V>> {
+    debug!("loading map: {name}");
+    let info = loaded_maps()
+        .filter_map(|m| m.ok())
+        .find(|m| m.name_as_str() == Some(name) && m.key_size() == key_size)
+        .with_context(|| format!("failed to get map info for: {name}"))?;
+
+    let map_data = aya::maps::MapData::from_id(info.id())
+        .with_context(|| format!("failed to get map data: {name}"))?;
+
+    let map: HashMap<_, K, V> = HashMap::try_from(Map::LruHashMap(map_data))
+        .with_context(|| format!("failed to convert LRU HashMap: {name}"))?;
+
+    Ok(map)
 }
 
 fn partition_list(list: &[String]) -> (Vec<u32>, Vec<[u8; 16]>) {
@@ -142,16 +196,48 @@ fn partition_list(list: &[String]) -> (Vec<u32>, Vec<[u8; 16]>) {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
+    if !nix::unistd::geteuid().is_root() {
+        error!("binary must be ran with root privaleges");
+        return Err(anyhow!("Binary must be ran as root"));
+    }
+
     let cli = cli().get_matches();
 
     if let Some(("inspect", _)) = cli.subcommand() {
-        debug!("running inpspection command");
-        let allowed_v4: HashMap<_, u32, Reputation> =
-            HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V4"))
-                    .context("failed to load ALLOWED_V4 pinned map")?,
-            ))
-            .context("failed to ALLOWED_V4 covert to HashMap")?;
+        debug!("running inspection command");
+
+        let pkt_counts_v4 = load_percpu_map::<u32, u64>("PKT_COUNTS_V4", 4)?;
+        let pkt_counts_v6 = load_percpu_map::<[u8; 16], u64>("PKT_COUNTS_V6", 16)?;
+
+        let unkown_counts_v4 = load_map::<u32, TokenBucket>("UNK_BKTS_V4", 4)?;
+        let unkown_counts_v6 = load_map::<[u8; 16], TokenBucket>("UNK_BKTS_V6", 16)?;
+
+        debug!("maps loaded");
+
+        // Allow and Block buckets
+        let allowed_v4: HashMap<_, u32, Reputation> = HashMap::try_from(Map::LruHashMap(
+            MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V4"))
+                .context("failed to load ALLOWED_V4 pinned map")?,
+        ))
+        .context("failed to ALLOWED_V4 covert to HashMap")?;
+
+        let allowed_v6: HashMap<_, [u8; 16], Reputation> = HashMap::try_from(Map::LruHashMap(
+            MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V6"))
+                .context("failed to load ALLOWED_V6 pinned map")?,
+        ))
+        .context("failed to ALLOWED_V6 covert to HashMap")?;
+
+        let blocked_v4: HashMap<_, u32, BlockedEntry> = HashMap::try_from(Map::LruHashMap(
+            MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V4"))
+                .context("failed to load BLOCKED_V4 pinned map")?,
+        ))
+        .context("failed to BLOCKED_V4 covert to HashMap")?;
+
+        let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> = HashMap::try_from(Map::LruHashMap(
+            MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V6"))
+                .context("failed to load BLOCKED_V6 pinned map")?,
+        ))
+        .context("failed to BLOCKED_V6 covert to HashMap")?;
 
         println!("=== ALLOWED_V4 ===");
         for (ip, rep) in allowed_v4.iter().flatten() {
@@ -159,25 +245,11 @@ async fn main() -> anyhow::Result<()> {
             println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
         }
 
-        let allowed_v6: HashMap<_, [u8; 16], Reputation> =
-            HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V6"))
-                    .context("failed to load ALLOWED_V6 pinned map")?,
-            ))
-            .context("failed to ALLOWED_V6 covert to HashMap")?;
-
         println!("\n=== ALLOWED_V6 ===");
         for (ip, rep) in allowed_v6.iter().flatten() {
             let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
             println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
         }
-
-        let blocked_v4: HashMap<_, u32, BlockedEntry> =
-            HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V4"))
-                    .context("failed to load BLOCKED_V4 pinned map")?,
-            ))
-            .context("failed to BLOCKED_V4 covert to HashMap")?;
 
         println!("\n=== BLOCKED_V4 ===");
         for (ip, rep) in blocked_v4.iter().flatten() {
@@ -185,17 +257,38 @@ async fn main() -> anyhow::Result<()> {
             println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
         }
 
-        let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> =
-            HashMap::try_from(aya::maps::Map::LruHashMap(
-                aya::maps::MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V6"))
-                    .context("failed to load BLOCKED_V6 pinned map")?,
-            ))
-            .context("failed to BLOCKED_V6 covert to HashMap")?;
-
         println!("\n=== BLOCKED_V6 ===");
         for (ip, rep) in blocked_v6.iter().flatten() {
             let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
             println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
+        }
+
+        println!("\n=== PACKET COUNTS V4 ===");
+        for (k, c) in pkt_counts_v4.iter().filter_map(|k| k.ok()) {
+            let ip = Ipv4Addr::from(k);
+            println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
+        }
+
+        println!("\n=== PACKET COUNTS V4 ===");
+        for (k, c) in pkt_counts_v6.iter().filter_map(|k| k.ok()) {
+            let ip = Ipv6Addr::from(k);
+            println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
+        }
+
+        println!("\n=== UNKOWN BUCKETS V4 ===");
+        for k in unkown_counts_v4.keys() {
+            if let Ok(k) = k {
+                let ip = Ipv4Addr::from(k);
+                println!("* {}", ip);
+            }
+        }
+
+        println!("\n=== UNKNOWN BUCKETS V6 ===");
+        for k in unkown_counts_v6.keys() {
+            if let Ok(k) = k {
+                let ip = Ipv6Addr::from(k);
+                println!("* {}", ip);
+            }
         }
 
         return Ok(());
@@ -246,9 +339,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
     info!("attached to the {} interface", iface);
 
-    println!("Waiting for Ctrl-C...");
+    info!("Waiting for Ctrl-C...");
 
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
     let (tx, mut rx) = mpsc::channel(10);
     let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
         let _ = tx.blocking_send(res);
@@ -285,7 +377,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = interval.tick() => {}
         }
     }
 

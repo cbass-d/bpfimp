@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
-nix = { version = "0.31.3", features = ["time"] }
+nix = { version = "0.31.3", features = ["time", "user"] }
 
 [build-dependencies]
 anyhow = { workspace = true }
