@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use libc::priority_t;
 use std::{
     collections::HashSet,
     hash::Hash,
@@ -128,17 +127,17 @@ fn map_of<'a, K: Pod, V: Pod>(
     )?)
 }
 
-/// Returns an `aya::maps::PerCpuHashMap` with the name provided if one
-/// exists
-fn percpu_map_of<'a, K: Pod, V: Pod>(
-    ebpf: &'a mut Ebpf,
-    name: &str,
-) -> Result<PerCpuHashMap<&'a mut MapData, K, V>> {
-    Ok(PerCpuHashMap::try_from(
-        ebpf.map_mut(name)
-            .with_context(|| format!("map {name} not found"))?,
-    )?)
-}
+// /// Returns an `aya::maps::PerCpuHashMap` with the name provided if one
+// /// exists
+//fn percpu_map_of<'a, K: Pod, V: Pod>(
+//    ebpf: &'a mut Ebpf,
+//    name: &str,
+//) -> Result<PerCpuHashMap<&'a mut MapData, K, V>> {
+//    Ok(PerCpuHashMap::try_from(
+//        ebpf.map_mut(name)
+//            .with_context(|| format!("map {name} not found"))?,
+//    )?)
+//}
 
 /// Return the per cpu map using 'loaded_maps()' if it exists on the host
 /// system
@@ -264,31 +263,27 @@ async fn main() -> anyhow::Result<()> {
         }
 
         println!("\n=== PACKET COUNTS V4 ===");
-        for (k, c) in pkt_counts_v4.iter().filter_map(|k| k.ok()) {
+        for (k, c) in pkt_counts_v4.iter().flatten() {
             let ip = Ipv4Addr::from(k);
             println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
         }
 
         println!("\n=== PACKET COUNTS V4 ===");
-        for (k, c) in pkt_counts_v6.iter().filter_map(|k| k.ok()) {
+        for (k, c) in pkt_counts_v6.iter().flatten() {
             let ip = Ipv6Addr::from(k);
             println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
         }
 
         println!("\n=== UNKOWN BUCKETS V4 ===");
-        for k in unkown_counts_v4.keys() {
-            if let Ok(k) = k {
-                let ip = Ipv4Addr::from(k);
-                println!("* {}", ip);
-            }
+        for k in unkown_counts_v4.keys().flatten() {
+            let ip = Ipv4Addr::from(k);
+            println!("* {}", ip);
         }
 
         println!("\n=== UNKNOWN BUCKETS V6 ===");
-        for k in unkown_counts_v6.keys() {
-            if let Ok(k) = k {
-                let ip = Ipv6Addr::from(k);
-                println!("* {}", ip);
-            }
+        for k in unkown_counts_v6.keys().flatten() {
+            let ip = Ipv6Addr::from(k);
+            println!("* {}", ip);
         }
 
         return Ok(());
