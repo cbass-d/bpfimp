@@ -36,6 +36,34 @@ struct Config {
     blocklist: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+struct AllowedRecord {
+    ip: IpAddr,
+    score: u32,
+    tokens: u32,
+}
+
+#[derive(serde::Serialize)]
+struct BlockedRecord {
+    ip: IpAddr,
+    hits: u64,
+    last_seen_ns: u64,
+}
+
+#[derive(serde::Serialize)]
+struct PacketCountRecord {
+    ip: IpAddr,
+    total: u64,
+}
+
+#[derive(serde::Serialize)]
+struct InspectOutput {
+    allowed: Vec<AllowedRecord>,
+    blocked: Vec<BlockedRecord>,
+    packet_counts: Vec<PacketCountRecord>,
+    unknown_buckets: Vec<IpAddr>,
+}
+
 fn clock_now_ns() -> u64 {
     let ts = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC get time failed");
 
@@ -56,7 +84,11 @@ fn cli() -> Command {
                         .value_parser(clap::value_parser!(PathBuf)),
                 ),
         )
-        .subcommand(Command::new("inspect").about("inspect bpf data persisted over runs"))
+        .subcommand(
+            Command::new("inspect")
+                .about("inspect bpf data persisted over runs")
+                .arg(arg!(-j --json "output as json")),
+        )
 }
 
 /// Sync the keys in maps using the `desired` hashset
@@ -202,14 +234,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = cli().get_matches();
 
-    if let Some(("inspect", _)) = cli.subcommand() {
-        debug!("running inspection command");
-
+    if let Some(("inspect", sub_matches)) = cli.subcommand() {
         let pkt_counts_v4 = load_percpu_map::<u32, u64>("PKT_COUNTS_V4", 4)?;
         let pkt_counts_v6 = load_percpu_map::<[u8; 16], u64>("PKT_COUNTS_V6", 16)?;
 
-        let unkown_counts_v4 = load_map::<u32, TokenBucket>("UNK_BKTS_V4", 4)?;
-        let unkown_counts_v6 = load_map::<[u8; 16], TokenBucket>("UNK_BKTS_V6", 16)?;
+        let unknown_counts_v4 = load_map::<u32, TokenBucket>("UNK_BKTS_V4", 4)?;
+        let unknown_counts_v6 = load_map::<[u8; 16], TokenBucket>("UNK_BKTS_V6", 16)?;
 
         debug!("maps loaded");
 
@@ -238,52 +268,123 @@ async fn main() -> anyhow::Result<()> {
         ))
         .context("failed to BLOCKED_V6 covert to HashMap")?;
 
-        println!("=== ALLOWED_V4 ===");
-        for (ip, rep) in allowed_v4.iter().flatten() {
-            let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
-            println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
-        }
+        if sub_matches.get_flag("json") {
+            let mut allowed: Vec<AllowedRecord> = allowed_v4
+                .iter()
+                .flatten()
+                .map(|(ip, rep)| AllowedRecord {
+                    ip: IpAddr::V4(Ipv4Addr::from(ip)),
+                    score: rep.score,
+                    tokens: rep.bucket.tokens,
+                })
+                .collect();
+            allowed.extend(allowed_v6.iter().flatten().map(|(ip, rep)| AllowedRecord {
+                ip: IpAddr::V6(Ipv6Addr::from(ip)),
+                score: rep.score,
+                tokens: rep.bucket.tokens,
+            }));
 
-        println!("\n=== ALLOWED_V6 ===");
-        for (ip, rep) in allowed_v6.iter().flatten() {
-            let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
-            println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
-        }
+            let mut blocked: Vec<BlockedRecord> = blocked_v4
+                .iter()
+                .flatten()
+                .map(|(ip, e)| BlockedRecord {
+                    ip: IpAddr::V4(Ipv4Addr::from(ip)),
+                    hits: e.hits,
+                    last_seen_ns: e.last_seen_ns,
+                })
+                .collect();
+            blocked.extend(blocked_v6.iter().flatten().map(|(ip, e)| BlockedRecord {
+                ip: IpAddr::V6(Ipv6Addr::from(ip)),
+                hits: e.hits,
+                last_seen_ns: e.last_seen_ns,
+            }));
 
-        println!("\n=== BLOCKED_V4 ===");
-        for (ip, rep) in blocked_v4.iter().flatten() {
-            let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
-            println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
-        }
+            let mut packet_counts: Vec<PacketCountRecord> = pkt_counts_v4
+                .iter()
+                .flatten()
+                .map(|(k, c)| PacketCountRecord {
+                    ip: IpAddr::V4(Ipv4Addr::from(k)),
+                    total: c.iter().sum(),
+                })
+                .collect();
+            packet_counts.extend(
+                pkt_counts_v6
+                    .iter()
+                    .flatten()
+                    .map(|(k, c)| PacketCountRecord {
+                        ip: IpAddr::V6(Ipv6Addr::from(k)),
+                        total: c.iter().sum(),
+                    }),
+            );
 
-        println!("\n=== BLOCKED_V6 ===");
-        for (ip, rep) in blocked_v6.iter().flatten() {
-            let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
-            println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
-        }
+            let mut unknown_buckets: Vec<IpAddr> = unknown_counts_v4
+                .keys()
+                .flatten()
+                .map(|k| IpAddr::V4(Ipv4Addr::from(k)))
+                .collect();
+            unknown_buckets.extend(
+                unknown_counts_v6
+                    .keys()
+                    .flatten()
+                    .map(|k| IpAddr::V6(Ipv6Addr::from(k))),
+            );
 
-        println!("\n=== PACKET COUNTS V4 ===");
-        for (k, c) in pkt_counts_v4.iter().flatten() {
-            let ip = Ipv4Addr::from(k);
-            println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
-        }
+            let output = InspectOutput {
+                allowed,
+                blocked,
+                packet_counts,
+                unknown_buckets,
+            };
 
-        println!("\n=== PACKET COUNTS V4 ===");
-        for (k, c) in pkt_counts_v6.iter().flatten() {
-            let ip = Ipv6Addr::from(k);
-            println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
-        }
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!("=== ALLOWED_V4 ===");
+            for (ip, rep) in allowed_v4.iter().flatten() {
+                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
+                println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
+            }
 
-        println!("\n=== UNKOWN BUCKETS V4 ===");
-        for k in unkown_counts_v4.keys().flatten() {
-            let ip = Ipv4Addr::from(k);
-            println!("* {}", ip);
-        }
+            println!("\n=== ALLOWED_V6 ===");
+            for (ip, rep) in allowed_v6.iter().flatten() {
+                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
+                println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
+            }
 
-        println!("\n=== UNKNOWN BUCKETS V6 ===");
-        for k in unkown_counts_v6.keys().flatten() {
-            let ip = Ipv6Addr::from(k);
-            println!("* {}", ip);
+            println!("\n=== BLOCKED_V4 ===");
+            for (ip, rep) in blocked_v4.iter().flatten() {
+                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
+                println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
+            }
+
+            println!("\n=== BLOCKED_V6 ===");
+            for (ip, rep) in blocked_v6.iter().flatten() {
+                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
+                println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
+            }
+
+            println!("\n=== PACKET COUNTS V4 ===");
+            for (k, c) in pkt_counts_v4.iter().flatten() {
+                let ip = Ipv4Addr::from(k);
+                println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
+            }
+
+            println!("\n=== PACKET COUNTS V6 ===");
+            for (k, c) in pkt_counts_v6.iter().flatten() {
+                let ip = Ipv6Addr::from(k);
+                println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
+            }
+
+            println!("\n=== UNKOWN BUCKETS V4 ===");
+            for k in unknown_counts_v4.keys().flatten() {
+                let ip = Ipv4Addr::from(k);
+                println!("* {}", ip);
+            }
+
+            println!("\n=== UNKNOWN BUCKETS V6 ===");
+            for k in unknown_counts_v6.keys().flatten() {
+                let ip = Ipv6Addr::from(k);
+                println!("* {}", ip);
+            }
         }
 
         return Ok(());
