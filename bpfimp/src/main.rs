@@ -15,7 +15,7 @@ use aya::{
     programs::{Xdp, XdpFlags},
 };
 use bpfimp_common::{BlockedEntry, Reputation, TokenBucket};
-use clap::{Command, arg};
+use clap::{ArgMatches, Command, arg};
 use log::{error, info};
 use nix::time::{ClockId, clock_gettime};
 use notify::{
@@ -182,13 +182,13 @@ fn load_percpu_map<K: Pod, V: Pod>(
     let info = loaded_maps()
         .filter_map(|m| m.ok())
         .find(|m| m.name_as_str() == Some(name) && m.key_size() == key_size)
-        .with_context(|| format!("failed to get map info for: {name}"))?;
+        .with_context(|| format!("map {name} not found among loaded BPF maps"))?;
 
     let map_data = aya::maps::MapData::from_id(info.id())
-        .with_context(|| format!("failed to get map data: {name}"))?;
+        .with_context(|| format!("failed to open map {name} (id {})", info.id()))?;
 
     let map: PerCpuHashMap<_, K, V> = PerCpuHashMap::try_from(Map::PerCpuLruHashMap(map_data))
-        .with_context(|| format!("failed to convert LRU HashMap: {name}"))?;
+        .with_context(|| format!("map {name} is not a per-cpu hash of the expected type"))?;
 
     Ok(map)
 }
@@ -200,13 +200,13 @@ fn load_map<K: Pod, V: Pod>(name: &str, key_size: u32) -> Result<HashMap<MapData
     let info = loaded_maps()
         .filter_map(|m| m.ok())
         .find(|m| m.name_as_str() == Some(name) && m.key_size() == key_size)
-        .with_context(|| format!("failed to get map info for: {name}"))?;
+        .with_context(|| format!("map {name} not found among loaded BPF maps"))?;
 
     let map_data = aya::maps::MapData::from_id(info.id())
-        .with_context(|| format!("failed to get map data: {name}"))?;
+        .with_context(|| format!("failed to open map {name} (id {})", info.id()))?;
 
     let map: HashMap<_, K, V> = HashMap::try_from(Map::LruHashMap(map_data))
-        .with_context(|| format!("failed to convert LRU HashMap: {name}"))?;
+        .with_context(|| format!("map {name} is not a hash of the expected type"))?;
 
     Ok(map)
 }
@@ -224,6 +224,158 @@ fn partition_list(list: &[String]) -> (Vec<u32>, Vec<[u8; 16]>) {
     (v4, v6)
 }
 
+/// Open a pinned LRU hash map from the bpffs and convert it to a typed
+/// `aya::maps::HashMap`
+fn load_pinned_lru<K: Pod, V: Pod>(name: &str) -> Result<HashMap<MapData, K, V>> {
+    let map = MapData::from_pin(format!("{BPFS_FS_PATH}/{name}"))
+        .with_context(|| format!("failed to open pinned map {name}"))?;
+    HashMap::try_from(Map::LruHashMap(map))
+        .with_context(|| format!("failed to convert pinned map {name} to HashMap"))
+}
+
+fn collect_allowed(
+    v4: &HashMap<MapData, u32, Reputation>,
+    v6: &HashMap<MapData, [u8; 16], Reputation>,
+) -> Vec<AllowedRecord> {
+    let mut out: Vec<AllowedRecord> = v4
+        .iter()
+        .flatten()
+        .map(|(ip, rep)| AllowedRecord {
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            score: rep.score,
+            tokens: rep.bucket.tokens,
+        })
+        .collect();
+    out.extend(v6.iter().flatten().map(|(ip, rep)| AllowedRecord {
+        ip: IpAddr::V6(Ipv6Addr::from(ip)),
+        score: rep.score,
+        tokens: rep.bucket.tokens,
+    }));
+    out
+}
+
+fn collect_blocked(
+    v4: &HashMap<MapData, u32, BlockedEntry>,
+    v6: &HashMap<MapData, [u8; 16], BlockedEntry>,
+) -> Vec<BlockedRecord> {
+    let mut out: Vec<BlockedRecord> = v4
+        .iter()
+        .flatten()
+        .map(|(ip, e)| BlockedRecord {
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            hits: e.hits,
+            last_seen_ns: e.last_seen_ns,
+        })
+        .collect();
+    out.extend(v6.iter().flatten().map(|(ip, e)| BlockedRecord {
+        ip: IpAddr::V6(Ipv6Addr::from(ip)),
+        hits: e.hits,
+        last_seen_ns: e.last_seen_ns,
+    }));
+    out
+}
+
+fn collect_counts(
+    v4: &PerCpuHashMap<MapData, u32, u64>,
+    v6: &PerCpuHashMap<MapData, [u8; 16], u64>,
+) -> Vec<PacketCountRecord> {
+    let mut out: Vec<PacketCountRecord> = v4
+        .iter()
+        .flatten()
+        .map(|(k, c)| PacketCountRecord {
+            ip: IpAddr::V4(Ipv4Addr::from(k)),
+            total: c.iter().sum(),
+        })
+        .collect();
+    out.extend(v6.iter().flatten().map(|(k, c)| PacketCountRecord {
+        ip: IpAddr::V6(Ipv6Addr::from(k)),
+        total: c.iter().sum(),
+    }));
+    out
+}
+
+fn collect_unknown(
+    v4: &HashMap<MapData, u32, TokenBucket>,
+    v6: &HashMap<MapData, [u8; 16], TokenBucket>,
+) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = v4
+        .keys()
+        .flatten()
+        .map(|k| IpAddr::V4(Ipv4Addr::from(k)))
+        .collect();
+    out.extend(v6.keys().flatten().map(|k| IpAddr::V6(Ipv6Addr::from(k))));
+    out
+}
+
+fn print_human(output: &InspectOutput) {
+    println!("=== ALLOWED ===");
+    for r in &output.allowed {
+        println!("* {}\n\t- Rep Score: {}", r.ip, r.score);
+    }
+
+    println!("\n=== BLOCKED ===");
+    for r in &output.blocked {
+        println!("* {}\n\t- Hits: {}", r.ip, r.hits);
+    }
+
+    println!("\n=== PACKET COUNTS ===");
+    for r in &output.packet_counts {
+        println!("* {}\n\t Total: {}", r.ip, r.total);
+    }
+
+    println!("\n=== UNKNOWN BUCKETS ===");
+    for ip in &output.unknown_buckets {
+        println!("* {ip}");
+    }
+}
+
+/// Check that a bpfimp instance is loaded before trying to read its maps,
+/// so callers get one clear message instead of a per-map load error
+fn ensure_running() -> Result<()> {
+    let running = loaded_maps()
+        .filter_map(|m| m.ok())
+        .any(|m| m.name_as_str() == Some("PKT_COUNTS_V4"));
+
+    if !running {
+        return Err(anyhow!("bpfimp does not appear to be running"));
+    }
+
+    Ok(())
+}
+
+fn inspect(sub_matches: &ArgMatches) -> Result<()> {
+    ensure_running()?;
+
+    // Read from the kernel by id
+    let pkt_counts_v4 = load_percpu_map::<u32, u64>("PKT_COUNTS_V4", 4)?;
+    let pkt_counts_v6 = load_percpu_map::<[u8; 16], u64>("PKT_COUNTS_V6", 16)?;
+    let unknown_counts_v4 = load_map::<u32, TokenBucket>("UNK_BKTS_V4", 4)?;
+    let unknown_counts_v6 = load_map::<[u8; 16], TokenBucket>("UNK_BKTS_V6", 16)?;
+
+    // Allow and Block buckets, read from their pins
+    let allowed_v4 = load_pinned_lru::<u32, Reputation>("ALLOWED_BUCKETS_V4")?;
+    let allowed_v6 = load_pinned_lru::<[u8; 16], Reputation>("ALLOWED_BUCKETS_V6")?;
+    let blocked_v4 = load_pinned_lru::<u32, BlockedEntry>("BLOCKED_BUCKETS_V4")?;
+    let blocked_v6 = load_pinned_lru::<[u8; 16], BlockedEntry>("BLOCKED_BUCKETS_V6")?;
+
+    debug!("all maps loaded");
+
+    let output = InspectOutput {
+        allowed: collect_allowed(&allowed_v4, &allowed_v6),
+        blocked: collect_blocked(&blocked_v4, &blocked_v6),
+        packet_counts: collect_counts(&pkt_counts_v4, &pkt_counts_v6),
+        unknown_buckets: collect_unknown(&unknown_counts_v4, &unknown_counts_v6),
+    };
+
+    if sub_matches.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print_human(&output);
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -236,158 +388,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli().get_matches();
 
     if let Some(("inspect", sub_matches)) = cli.subcommand() {
-        let pkt_counts_v4 = load_percpu_map::<u32, u64>("PKT_COUNTS_V4", 4)?;
-        let pkt_counts_v6 = load_percpu_map::<[u8; 16], u64>("PKT_COUNTS_V6", 16)?;
-
-        let unknown_counts_v4 = load_map::<u32, TokenBucket>("UNK_BKTS_V4", 4)?;
-        let unknown_counts_v6 = load_map::<[u8; 16], TokenBucket>("UNK_BKTS_V6", 16)?;
-
-        debug!("maps loaded");
-
-        // Allow and Block buckets
-        let allowed_v4: HashMap<_, u32, Reputation> = HashMap::try_from(Map::LruHashMap(
-            MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V4"))
-                .context("failed to load ALLOWED_V4 pinned map")?,
-        ))
-        .context("failed to ALLOWED_V4 covert to HashMap")?;
-
-        let allowed_v6: HashMap<_, [u8; 16], Reputation> = HashMap::try_from(Map::LruHashMap(
-            MapData::from_pin(format!("{BPFS_FS_PATH}/ALLOWED_BUCKETS_V6"))
-                .context("failed to load ALLOWED_V6 pinned map")?,
-        ))
-        .context("failed to ALLOWED_V6 covert to HashMap")?;
-
-        let blocked_v4: HashMap<_, u32, BlockedEntry> = HashMap::try_from(Map::LruHashMap(
-            MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V4"))
-                .context("failed to load BLOCKED_V4 pinned map")?,
-        ))
-        .context("failed to BLOCKED_V4 covert to HashMap")?;
-
-        let blocked_v6: HashMap<_, [u8; 16], BlockedEntry> = HashMap::try_from(Map::LruHashMap(
-            MapData::from_pin(format!("{BPFS_FS_PATH}/BLOCKED_BUCKETS_V6"))
-                .context("failed to load BLOCKED_V6 pinned map")?,
-        ))
-        .context("failed to BLOCKED_V6 covert to HashMap")?;
-
-        if sub_matches.get_flag("json") {
-            let mut allowed: Vec<AllowedRecord> = allowed_v4
-                .iter()
-                .flatten()
-                .map(|(ip, rep)| AllowedRecord {
-                    ip: IpAddr::V4(Ipv4Addr::from(ip)),
-                    score: rep.score,
-                    tokens: rep.bucket.tokens,
-                })
-                .collect();
-            allowed.extend(allowed_v6.iter().flatten().map(|(ip, rep)| AllowedRecord {
-                ip: IpAddr::V6(Ipv6Addr::from(ip)),
-                score: rep.score,
-                tokens: rep.bucket.tokens,
-            }));
-
-            let mut blocked: Vec<BlockedRecord> = blocked_v4
-                .iter()
-                .flatten()
-                .map(|(ip, e)| BlockedRecord {
-                    ip: IpAddr::V4(Ipv4Addr::from(ip)),
-                    hits: e.hits,
-                    last_seen_ns: e.last_seen_ns,
-                })
-                .collect();
-            blocked.extend(blocked_v6.iter().flatten().map(|(ip, e)| BlockedRecord {
-                ip: IpAddr::V6(Ipv6Addr::from(ip)),
-                hits: e.hits,
-                last_seen_ns: e.last_seen_ns,
-            }));
-
-            let mut packet_counts: Vec<PacketCountRecord> = pkt_counts_v4
-                .iter()
-                .flatten()
-                .map(|(k, c)| PacketCountRecord {
-                    ip: IpAddr::V4(Ipv4Addr::from(k)),
-                    total: c.iter().sum(),
-                })
-                .collect();
-            packet_counts.extend(
-                pkt_counts_v6
-                    .iter()
-                    .flatten()
-                    .map(|(k, c)| PacketCountRecord {
-                        ip: IpAddr::V6(Ipv6Addr::from(k)),
-                        total: c.iter().sum(),
-                    }),
-            );
-
-            let mut unknown_buckets: Vec<IpAddr> = unknown_counts_v4
-                .keys()
-                .flatten()
-                .map(|k| IpAddr::V4(Ipv4Addr::from(k)))
-                .collect();
-            unknown_buckets.extend(
-                unknown_counts_v6
-                    .keys()
-                    .flatten()
-                    .map(|k| IpAddr::V6(Ipv6Addr::from(k))),
-            );
-
-            let output = InspectOutput {
-                allowed,
-                blocked,
-                packet_counts,
-                unknown_buckets,
-            };
-
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!("=== ALLOWED_V4 ===");
-            for (ip, rep) in allowed_v4.iter().flatten() {
-                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
-                println!("* {ip_v4}\n\t- Rep Score: {}", rep.score);
-            }
-
-            println!("\n=== ALLOWED_V6 ===");
-            for (ip, rep) in allowed_v6.iter().flatten() {
-                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
-                println!("* {ip_v6}\n\t- Rep Score: {}", rep.score);
-            }
-
-            println!("\n=== BLOCKED_V4 ===");
-            for (ip, rep) in blocked_v4.iter().flatten() {
-                let ip_v4 = IpAddr::V4(Ipv4Addr::from(ip));
-                println!("* {ip_v4}\n\t- Hits: {}", rep.hits);
-            }
-
-            println!("\n=== BLOCKED_V6 ===");
-            for (ip, rep) in blocked_v6.iter().flatten() {
-                let ip_v6 = IpAddr::V6(Ipv6Addr::from_octets(ip));
-                println!("* {ip_v6}\n\t- Hits: {}", rep.hits);
-            }
-
-            println!("\n=== PACKET COUNTS V4 ===");
-            for (k, c) in pkt_counts_v4.iter().flatten() {
-                let ip = Ipv4Addr::from(k);
-                println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
-            }
-
-            println!("\n=== PACKET COUNTS V6 ===");
-            for (k, c) in pkt_counts_v6.iter().flatten() {
-                let ip = Ipv6Addr::from(k);
-                println!("* {}\n\t Total: {}", ip, c.iter().sum::<u64>());
-            }
-
-            println!("\n=== UNKOWN BUCKETS V4 ===");
-            for k in unknown_counts_v4.keys().flatten() {
-                let ip = Ipv4Addr::from(k);
-                println!("* {}", ip);
-            }
-
-            println!("\n=== UNKNOWN BUCKETS V6 ===");
-            for k in unknown_counts_v6.keys().flatten() {
-                let ip = Ipv6Addr::from(k);
-                println!("* {}", ip);
-            }
-        }
-
+        inspect(sub_matches).with_context(|| "failed to handle inspect command")?;
         return Ok(());
     }
 
