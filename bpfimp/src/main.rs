@@ -11,19 +11,19 @@ use std::{
 use anyhow::Context as _;
 use aya::{
     Ebpf, EbpfLoader, Pod,
-    maps::{HashMap, Map, MapData, PerCpuHashMap, loaded_maps},
-    programs::{Xdp, XdpFlags},
+    maps::{HashMap, Map, MapData, PerCpuHashMap, RingBuf, loaded_maps},
+    programs::{Xdp, XdpFlags, loaded_programs},
 };
-use bpfimp_common::{BlockedEntry, Reputation, TokenBucket};
+use bpfimp_common::{BlockedEntry, EventKind, ImpEvent, Reputation, TokenBucket};
 use clap::{ArgMatches, Command, arg};
 use log::{error, info};
 use nix::time::{ClockId, clock_gettime};
 use notify::{
-    EventKind, RecursiveMode,
+    RecursiveMode,
     event::{AccessKind, AccessMode},
 };
 use notify_debouncer_full::{DebouncedEvent, new_debouncer};
-use tokio::sync::mpsc;
+use tokio::{io::unix::AsyncFd, sync::mpsc};
 #[rustfmt::skip]
 use log::{debug, warn};
 use tokio::signal;
@@ -65,6 +65,35 @@ struct InspectOutput {
     unknown_buckets: Vec<IpAddr>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WatchEvent {
+    Drop {
+        ts_ns: u64,
+        ip: IpAddr,
+        ip_version: u8,
+    },
+}
+
+impl WatchEvent {
+    fn from_wire(e: &ImpEvent) -> Result<Self> {
+        let ip = match e.ip_version {
+            4 => IpAddr::V4(Ipv4Addr::new(e.addr[0], e.addr[1], e.addr[2], e.addr[3])),
+            6 => IpAddr::V6(Ipv6Addr::from(e.addr)),
+            v => return Err(anyhow!("invalid ip version on wire: {v}")),
+        };
+
+        match e.kind {
+            k if k == EventKind::Drop as u8 => Ok(WatchEvent::Drop {
+                ts_ns: e.ts_ns,
+                ip,
+                ip_version: e.ip_version,
+            }),
+            e => Err(anyhow!("invalid event kind on wire: {e}")),
+        }
+    }
+}
+
 fn clock_now_ns() -> u64 {
     let ts = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC get time failed");
 
@@ -89,6 +118,11 @@ fn cli() -> Command {
             Command::new("inspect")
                 .about("inspect bpf data persisted over runs")
                 .arg(arg!(-j --json "output as json")),
+        )
+        .subcommand(
+            Command::new("watch")
+                .about("tail a live feed of events (drops/blocks)")
+                .arg(arg!(-j --json "output as JSON lines")),
         )
 }
 
@@ -332,9 +366,9 @@ fn print_human(output: &InspectOutput) {
 /// Check that a bpfimp instance is loaded before trying to read its maps,
 /// so callers get one clear message instead of a per-map load error
 fn ensure_running() -> Result<()> {
-    let running = loaded_maps()
-        .filter_map(|m| m.ok())
-        .any(|m| m.name_as_str() == Some("PKT_COUNTS_V4"));
+    let running = loaded_programs()
+        .filter_map(|p| p.ok())
+        .any(|m| m.name_as_str() == Some("bpfimp"));
 
     if !running {
         return Err(anyhow!("bpfimp does not appear to be running"));
@@ -343,8 +377,74 @@ fn ensure_running() -> Result<()> {
     Ok(())
 }
 
+/// Locate a loaded ring buffer map by name and open it for reading
+fn load_ringbuf(name: &str) -> Result<RingBuf<MapData>> {
+    debug!("loading ring buffer: {name}");
+
+    let info = loaded_maps()
+        .filter_map(|m| m.ok())
+        .find(|m| m.name_as_str() == Some(name))
+        .with_context(|| format!("ringbuf {name} not found among loaded BPF maps"))?;
+
+    let map_data = MapData::from_id(info.id())
+        .with_context(|| format!("failed to open ringbuf {name} (id {})", info.id()))?;
+
+    RingBuf::try_from(Map::RingBuf(map_data))
+        .with_context(|| format!("map {name} is not a ring buffer"))
+}
+
+fn print_event(ev: &WatchEvent, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(ev)?);
+    } else {
+        match ev {
+            WatchEvent::Drop { ts_ns, ip, .. } => println!("[{ts_ns}] DROP {ip}"),
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_watch(ring: RingBuf<MapData>, json: bool) -> Result<()> {
+    let mut fd = AsyncFd::new(ring)?;
+
+    loop {
+        let mut guard = fd.readable_mut().await?;
+        let ring = guard.get_inner_mut();
+
+        // One readiness notification can cover many records, drain until empty
+        while let Some(item) = ring.next() {
+            let bytes = &item;
+            if bytes.len() < std::mem::size_of::<ImpEvent>() {
+                continue;
+            }
+
+            // ImpEvent is Pod, read_unaligned is sound regardless of alignment
+            let raw: ImpEvent = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
+
+            match WatchEvent::from_wire(&raw) {
+                Ok(ev) => print_event(&ev, json)?,
+                Err(e) => warn!("dropping malformed event: {e}"),
+            }
+        }
+
+        guard.clear_ready();
+    }
+}
+
+async fn watch(sub_matches: &ArgMatches) -> Result<()> {
+    ensure_running()?;
+
+    debug!("running watch command");
+
+    let ring = load_ringbuf("EVENTS")?;
+    run_watch(ring, sub_matches.get_flag("json")).await
+}
+
 fn inspect(sub_matches: &ArgMatches) -> Result<()> {
     ensure_running()?;
+
+    debug!("running inspect command");
 
     // Read from the kernel by id
     let pkt_counts_v4 = load_percpu_map::<u32, u64>("PKT_COUNTS_V4", 4)?;
@@ -389,6 +489,13 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(("inspect", sub_matches)) = cli.subcommand() {
         inspect(sub_matches).with_context(|| "failed to handle inspect command")?;
+        return Ok(());
+    }
+
+    if let Some(("watch", sub_matches)) = cli.subcommand() {
+        watch(sub_matches)
+            .await
+            .with_context(|| "failed to handle watch command")?;
         return Ok(());
     }
 
@@ -474,7 +581,7 @@ async fn main() -> anyhow::Result<()> {
 
             Some(Ok(events)) = rx.recv() => {
                 let is_config_save = |e: &DebouncedEvent| {
-                    matches!(e.kind, EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                    matches!(e.kind, notify::EventKind::Access(AccessKind::Close(AccessMode::Write)))
                     && e.paths.iter().any(|p| p.ends_with(config))
                 };
 

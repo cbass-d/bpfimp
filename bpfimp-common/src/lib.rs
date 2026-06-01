@@ -8,6 +8,29 @@ pub const REFILL_PER_SEC: u32 = 10;
 pub const PENALTY: u32 = 10;
 const NS_PER_SEC: u64 = 1_000_000_000;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpVersion {
+    V4 = 4,
+    V6 = 6,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Drop = 0,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ImpEvent {
+    pub ts_ns: u64,
+    pub addr: [u8; 16],
+    pub kind: u8,
+    pub ip_version: u8,
+    pub _pad: [u8; 6],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TokenBucket {
@@ -71,6 +94,9 @@ unsafe impl aya::Pod for Reputation {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for BlockedEntry {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ImpEvent {}
 
 #[cfg(test)]
 mod tests {

@@ -7,18 +7,21 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{LruHashMap, LruPerCpuHashMap},
+    maps::{LruHashMap, LruPerCpuHashMap, RingBuf},
     programs::XdpContext,
 };
 use aya_log_ebpf::{info, trace};
 use bpfimp_common::{
-    BlockedEntry, MAX_SCORE, MAX_TOKENS, MIN_SCORE_TO_PASS, PENALTY, REFILL_PER_SEC, Reputation,
-    TokenBucket,
+    BlockedEntry, EventKind, ImpEvent, IpVersion, MAX_SCORE, MAX_TOKENS, MIN_SCORE_TO_PASS,
+    PENALTY, REFILL_PER_SEC, Reputation, TokenBucket,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
+
+#[map]
+static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static PKT_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
@@ -60,6 +63,19 @@ pub fn bpfimp(ctx: XdpContext) -> u32 {
     }
 }
 
+#[inline]
+fn emit_drop(version: IpVersion, addr: [u8; 16]) {
+    let ev = ImpEvent {
+        ts_ns: unsafe { bpf_ktime_get_ns() },
+        addr,
+        kind: EventKind::Drop as u8,
+        ip_version: version as u8,
+        _pad: [0; 6],
+    };
+
+    let _ = EVENTS.output(&ev, 0);
+}
+
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     let start = ctx.data();
@@ -77,6 +93,9 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
     let src_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
 
+    let mut addr = [0u8; 16];
+    addr[..4].copy_from_slice(&src_addr.to_be_bytes());
+
     if let Some(entry) = BLOCKED_BUCKETS_V4.get_ptr_mut(&src_addr) {
         trace!(ctx, "packet from blocked ip");
 
@@ -84,6 +103,8 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
             (*entry).hits += 1;
             (*entry).last_seen_ns = bpf_ktime_get_ns();
         }
+
+        emit_drop(IpVersion::V4, addr);
 
         return Ok(false);
     }
@@ -124,6 +145,10 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
         }
     };
 
+    if !allowed {
+        emit_drop(IpVersion::V4, addr);
+    }
+
     Ok(allowed)
 }
 
@@ -138,6 +163,8 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
             (*entry).hits += 1;
             (*entry).last_seen_ns = bpf_ktime_get_ns();
         }
+
+        emit_drop(IpVersion::V6, src_addr);
 
         return Ok(false);
     }
@@ -177,6 +204,10 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
             true
         }
     };
+
+    if !allowed {
+        emit_drop(IpVersion::V6, src_addr);
+    }
 
     Ok(allowed)
 }
