@@ -1,8 +1,9 @@
 # bpfimp
 
 An XDP-based packet rate limiter written in Rust with [aya]. Traffic is
-classified per source IP and metered against a token bucket in the kernel; a
-small userspace control plane hot-reloads allow/block lists from disk.
+classified per source IP and metered against a token bucket in the kernel.
+A small userspace control plane hot-reloads allow/block lists from disk,
+snapshots live state on demand, and streams drop events over a ring buffer.
 Handles both IPv4 and IPv6.
 
 > Status: working demo. Tested against a veth/netns harness.
@@ -16,7 +17,7 @@ program:
    (`BLOCKED_BUCKETS_V4` / `BLOCKED_BUCKETS_V6`). A hit drops the packet and
    bumps a per-entry hit counter.
 2. Otherwise increments a per-source-IP packet counter
-   (`PACKET_COUNTS_V4` / `PACKET_COUNTS_V6`).
+   (`PKT_COUNTS_V4` / `PKT_COUNTS_V6`).
 3. Looks the source up in one of two LRU maps:
    - **Allowed peers** (`ALLOWED_BUCKETS_V4` / `ALLOWED_BUCKETS_V6`) — IPs
      loaded from `bpfimp.toml`. Each has a token bucket *and* a reputation
@@ -25,13 +26,19 @@ program:
      packets nudge the score up (capped at `MAX_SCORE`); a denied packet
      subtracts `PENALTY`. This lets a trusted peer absorb a burst but get
      throttled if it sustains abuse.
-   - **Unknown IPs** (`UNKNOWN_BUCKETS_V4` / `UNKNOWN_BUCKETS_V6`) —
-     auto-inserted with a smaller starting balance (`NEW_MAX_TOKENS`) and a
-     plain token bucket.
-4. Returns `XDP_PASS` or `XDP_DROP` based on the result.
+   - **Unknown IPs** (`UNK_BKTS_V4` / `UNK_BKTS_V6`) — auto-inserted with a
+     smaller starting balance (`NEW_MAX_TOKENS`) and a plain token bucket.
+4. Returns `XDP_PASS` or `XDP_DROP` based on the result. On every drop
+   (blocklist hit *or* an empty bucket) it also pushes a compact event record
+   onto a ring buffer (`EVENTS`) that userspace can stream live — see
+   [`watch`](#cli).
 
 IPv4 and IPv6 are tracked in independent map families; a peer that appears
 under both families gets two independent buckets and reputations.
+
+> Map names are capped at 16 characters by the kernel, which is why the
+> in-tree names are abbreviated (`PKT_COUNTS_V4`, `UNK_BKTS_V4`) rather than
+> spelled out.
 
 Userspace (`bpfimp`) loads the program, attaches it to `--iface`, and watches
 `bpfimp.toml` with a debounced filesystem notifier so edits take effect
@@ -48,33 +55,43 @@ without a restart.
    BLOCKED_BUCKETS_V{4,6} ◄──|──┐
         │                 |    │
         ▼                 |    ├── bpfimp.toml  (notify + debouncer)
-   PACKET_COUNTS_V{4,6}   |    │
+   PKT_COUNTS_V{4,6}      |    │
         │                 |    │
         ▼                 |    │
    ALLOWED_BUCKETS_V{4,6} ◄──|─┘
-   UNKNOWN_BUCKETS_V{4,6} |
+   UNK_BKTS_V{4,6}        |
         │                 |
         ▼                 |
    XDP_PASS / XDP_DROP    |
+        │                 |
+        └─ on drop ──► EVENTS ringbuf ──|──► bpfimp watch  (live JSONL stream)
 ```
 
 The three crates split cleanly: `bpfimp-ebpf` is the `no_std` kernel program,
 `bpfimp` is the Tokio-based loader, and `bpfimp-common` holds the POD types
-(`TokenBucket`, `Reputation`, `BlockedEntry`) and policy constants shared by
-both sides.
+(`TokenBucket`, `Reputation`, `BlockedEntry`, and the `ImpEvent` wire record)
+plus the policy constants shared by both sides.
 
 ## Persistence
 
-The maps are pinned to bpffs under `/sys/fs/bpf/bpfimp/`. The loader declares
-them with `pinned(...)` on the kernel side and opens them through
-`EbpfLoader::map_pin_path("/sys/fs/bpf/bpfimp")`, so on startup it reuses an
-existing pin when one is present and creates+pins a fresh map otherwise. As a
-result reputation scores, block-hit counters, and per-IP packet totals survive
-a `bpfimp run` restart — they are *not* zeroed on reload.
+The **policy** maps — `ALLOWED_BUCKETS_V{4,6}` and `BLOCKED_BUCKETS_V{4,6}` —
+are pinned to bpffs under `/sys/fs/bpf/bpfimp/`. They are declared with
+`pinned(...)` on the kernel side and opened through
+`EbpfLoader::map_pin_path("/sys/fs/bpf/bpfimp")`, so on startup the loader
+reuses an existing pin when one is present and creates+pins a fresh map
+otherwise. As a result **reputation scores and block-hit counters survive a
+`bpfimp run` restart** — they are *not* zeroed on reload.
 
-`bpfimp inspect` reads those pinned maps directly without loading or attaching
-the eBPF program, so you can dump the persisted state at any time (even while
-`bpfimp run` is not active). To wipe the state, remove the pins:
+The **telemetry** maps — `PKT_COUNTS_V{4,6}` and `UNK_BKTS_V{4,6}` — are *not*
+pinned. They live only while the program is loaded and are cleared when
+`bpfimp run` exits, so per-IP packet totals and auto-tracked unknown buckets
+reset on restart. (`EVENTS` is a ring buffer and is likewise transient.)
+
+> Note: bpffs is a kernel-memory filesystem, so **all** pins — and the
+> directory itself — are wiped on reboot. Pinning persists state across
+> *process* restarts within a boot, not across reboots.
+
+To wipe the persisted policy state, remove the pins:
 
 ```shell
 sudo rm -rf /sys/fs/bpf/bpfimp
@@ -108,7 +125,13 @@ sudo ./scripts/teardown_netns.sh
 ```
 
 The attached eBPF logs (`RUST_LOG=info`) show individual `packet dropped` lines
-as the bucket empties during the flood.
+as the bucket empties during the flood. For a structured feed of the same
+drops, run `bpfimp watch --json` in a third shell while the flood is going:
+
+```shell
+sudo bpfimp watch --json
+# {"type":"drop","ts_ns":1234567890,"ip":"10.200.0.2","ip_version":4}
+```
 
 The harness assigns both an IPv4 (`10.200.0.0/24`) and an IPv6 ULA
 (`fd00:200::/64`) address to each end of the veth, so both code paths are
@@ -158,7 +181,7 @@ unknown IP's bucket; an allowed peer with a healthy score absorbs bursts up to
 
 ## CLI
 
-`bpfimp` is subcommand-based:
+`bpfimp` is subcommand-based and must be run as root:
 
 ```
 bpfimp run [--iface <NAME>] [--config <PATH>]
@@ -166,15 +189,23 @@ bpfimp run [--iface <NAME>] [--config <PATH>]
   -i, --iface   interface to attach XDP to (default: wlan0)
   -c, --config  path to bpfimp.toml (default: ./bpfimp.toml)
 
-bpfimp inspect
+bpfimp inspect [--json]
+bpfimp watch   [--json]
 ```
 
 - **`run`** loads and attaches the XDP program, then watches the config file
   and reconciles the allow/block lists on every save.
-- **`inspect`** reads the pinned maps under `/sys/fs/bpf/bpfimp/` and prints the
-  current allowed-peer reputation scores and blocked-IP hit counts. It does not
-  load or attach the program, so it works whether or not `run` is active (as
-  long as the pins exist from a prior `run`).
+- **`inspect`** dumps a snapshot of the current state — allowed-peer reputation
+  scores and tokens, blocked-IP hit counts, per-IP packet totals, and the set
+  of auto-tracked unknown IPs. Pass `--json` for machine-readable output. It
+  reads the pinned policy maps *and* the live telemetry maps, so it **requires a
+  running `bpfimp run` instance** (it exits with "bpfimp does not appear to be
+  running" otherwise).
+- **`watch`** tails a live feed of drop events streamed from the `EVENTS` ring
+  buffer of a running instance, printing one record per drop. `--json` emits
+  newline-delimited JSON (JSONL), suitable for piping into `jq` or a log
+  shipper; without it, a short human-readable line per event. A ring buffer is
+  single-consumer, so run one `watch` at a time.
 
 `RUST_LOG=info` (or `debug`/`trace`) controls log verbosity.
 
