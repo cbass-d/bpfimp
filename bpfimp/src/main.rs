@@ -16,8 +16,8 @@ use aya::{
 };
 use bpfimp_common::{
     ALLOWED_V4_MAP, ALLOWED_V6_MAP, BLOCKED_V4_MAP, BLOCKED_V6_MAP, BPF_PROGRAM, BlockedEntry,
-    EVENTS_MAP, EventKind, ImpEvent, PKT_COUNTS_V4_MAP, PKT_COUNTS_V6_MAP, Reputation, TokenBucket,
-    UNK_BKTS_V4_MAP, UNK_BKTS_V6_MAP,
+    EVENTS_RINGBUF, EventKind, ImpEvent, PKT_COUNTS_V4_MAP, PKT_COUNTS_V6_MAP, Reputation,
+    TokenBucket, UNK_BKTS_V4_MAP, UNK_BKTS_V6_MAP,
 };
 use clap::{ArgMatches, Command, arg};
 use log::{debug, error, info, warn};
@@ -457,7 +457,7 @@ async fn watch(sub_matches: &ArgMatches) -> Result<()> {
 
     debug!("running watch command");
 
-    let ring = load_ringbuf(EVENTS_MAP)?;
+    let ring = load_ringbuf(EVENTS_RINGBUF)?;
     run_watch(ring, sub_matches.get_flag("json")).await
 }
 
