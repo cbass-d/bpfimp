@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use libc::siginfo_t;
 use std::{
     collections::HashSet,
     fs::DirBuilder,
@@ -23,7 +24,11 @@ use notify::{
     event::{AccessKind, AccessMode},
 };
 use notify_debouncer_full::{DebouncedEvent, new_debouncer};
-use tokio::{io::unix::AsyncFd, sync::mpsc};
+use tokio::{
+    io::unix::AsyncFd,
+    signal::unix::{SignalKind, signal},
+    sync::mpsc,
+};
 #[rustfmt::skip]
 use log::{debug, warn};
 use tokio::signal;
@@ -550,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
 
     let program: &mut Xdp = ebpf.program_mut("bpfimp").unwrap().try_into()?;
     program.load()?;
-    program.attach(iface, XdpFlags::default())
+    let link = program.attach(iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
     info!("attached to the {} interface", iface);
 
@@ -572,13 +577,21 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => warn!("peers reload failed: {e:#}"),
     }
 
+    let mut sigint = signal(SignalKind::interrupt())
+        .with_context(|| "failed to setup tokio signal for SIGINT")?;
+    let mut sigterm = signal(SignalKind::terminate())
+        .with_context(|| "failed to setup tokio signal for SIGTERM")?;
+
     loop {
         tokio::select! {
-            _  = signal::ctrl_c() => {
-                println!("Exiting...");
+            _ = sigint.recv() => {
+                info!("Exiting...");
                 break;
             }
-
+            _ = sigterm.recv() => {
+                info!("SIGTERM recieved, exiting...");
+                break;
+            }
             Some(Ok(events)) = rx.recv() => {
                 let is_config_save = |e: &DebouncedEvent| {
                     matches!(e.kind, notify::EventKind::Access(AccessKind::Close(AccessMode::Write)))
@@ -593,6 +606,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    drop(debouncer);
+
+    let program: &mut Xdp = ebpf
+        .program_mut("bpfimp")
+        .context("failed to get Xdp program for teardown")?
+        .try_into()
+        .context("program 'bpfimp' is not an Xdp program")?;
+
+    if let Err(e) = program.detach(link) {
+        warn!("failed to detach Xdp program cleanly: {e}");
+    } else {
+        info!("detached from {iface}");
     }
 
     Ok(())
