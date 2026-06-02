@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use libc::siginfo_t;
 use std::{
     collections::HashSet,
     fs::DirBuilder,
@@ -31,7 +30,6 @@ use tokio::{
 };
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::signal;
 
 const BPFS_FS_PATH: &str = "/sys/fs/bpf/bpfimp";
 
