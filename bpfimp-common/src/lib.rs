@@ -1,5 +1,16 @@
 #![no_std]
 
+pub const BPF_PROGRAM: &str = "bpfimp";
+pub const EVENTS_RINGBUF: &str = "EVENTS";
+pub const ALLOWED_V4_MAP: &str = "ALLOWED_BUCKETS_V4";
+pub const ALLOWED_V6_MAP: &str = "ALLOWED_BUCKETS_V6";
+pub const BLOCKED_V4_MAP: &str = "BLOCKED_BUCKETS_V4";
+pub const BLOCKED_V6_MAP: &str = "BLOCKED_BUCKETS_V6";
+pub const PKT_COUNTS_V4_MAP: &str = "PKT_COUNTS_V4";
+pub const PKT_COUNTS_V6_MAP: &str = "PKT_COUNTS_V6";
+pub const UNK_BKTS_V4_MAP: &str = "UNK_BKTS_V4";
+pub const UNK_BKTS_V6_MAP: &str = "UNK_BKTS_V6";
+
 pub const MAX_TOKENS: u32 = 200;
 pub const MAX_SCORE: u32 = 100;
 pub const NEW_MAX_TOKENS: u32 = 100;

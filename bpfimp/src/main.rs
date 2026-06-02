@@ -14,7 +14,11 @@ use aya::{
     maps::{HashMap, Map, MapData, PerCpuHashMap, RingBuf, loaded_maps},
     programs::{Xdp, XdpFlags, loaded_programs},
 };
-use bpfimp_common::{BlockedEntry, EventKind, ImpEvent, Reputation, TokenBucket};
+use bpfimp_common::{
+    ALLOWED_V4_MAP, ALLOWED_V6_MAP, BLOCKED_V4_MAP, BLOCKED_V6_MAP, BPF_PROGRAM, BlockedEntry,
+    EVENTS_MAP, EventKind, ImpEvent, PKT_COUNTS_V4_MAP, PKT_COUNTS_V6_MAP, Reputation, TokenBucket,
+    UNK_BKTS_V4_MAP, UNK_BKTS_V6_MAP,
+};
 use clap::{ArgMatches, Command, arg};
 use log::{debug, error, info, warn};
 use nix::time::{ClockId, clock_gettime};
@@ -182,16 +186,16 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let block_v4: HashSet<u32> = block_v4.into_iter().collect();
     let block_v6: HashSet<[u8; 16]> = block_v6.into_iter().collect();
 
-    sync_keys(&mut map_of(ebpf, "ALLOWED_BUCKETS_V4")?, &allow_v4, |_| {
+    sync_keys(&mut map_of(ebpf, ALLOWED_V4_MAP)?, &allow_v4, |_| {
         Reputation::new(now)
     })?;
-    sync_keys(&mut map_of(ebpf, "ALLOWED_BUCKETS_V6")?, &allow_v6, |_| {
+    sync_keys(&mut map_of(ebpf, ALLOWED_V6_MAP)?, &allow_v6, |_| {
         Reputation::new(now)
     })?;
-    sync_keys(&mut map_of(ebpf, "BLOCKED_BUCKETS_V4")?, &block_v4, |_| {
+    sync_keys(&mut map_of(ebpf, BLOCKED_V4_MAP)?, &block_v4, |_| {
         BlockedEntry::default()
     })?;
-    sync_keys(&mut map_of(ebpf, "BLOCKED_BUCKETS_V6")?, &block_v6, |_| {
+    sync_keys(&mut map_of(ebpf, BLOCKED_V6_MAP)?, &block_v6, |_| {
         BlockedEntry::default()
     })?;
 
@@ -373,7 +377,7 @@ fn print_human(output: &InspectOutput) {
 /// Fetch the loaded `bpfimp` XDP program from the ebpf object, with distinct
 /// errors for the two failure modes (missing program vs. wrong program type).
 fn xdp_program(ebpf: &mut Ebpf) -> Result<&mut Xdp> {
-    ebpf.program_mut("bpfimp")
+    ebpf.program_mut(BPF_PROGRAM)
         .context("program 'bpfimp' not found")?
         .try_into()
         .context("program 'bpfimp' is not an Xdp program")
@@ -384,7 +388,7 @@ fn xdp_program(ebpf: &mut Ebpf) -> Result<&mut Xdp> {
 fn ensure_running() -> Result<()> {
     let running = loaded_programs()
         .filter_map(|p| p.ok())
-        .any(|m| m.name_as_str() == Some("bpfimp"));
+        .any(|m| m.name_as_str() == Some(BPF_PROGRAM));
 
     if !running {
         return Err(anyhow!("bpfimp does not appear to be running"));
@@ -453,7 +457,7 @@ async fn watch(sub_matches: &ArgMatches) -> Result<()> {
 
     debug!("running watch command");
 
-    let ring = load_ringbuf("EVENTS")?;
+    let ring = load_ringbuf(EVENTS_MAP)?;
     run_watch(ring, sub_matches.get_flag("json")).await
 }
 
@@ -463,16 +467,16 @@ fn inspect(sub_matches: &ArgMatches) -> Result<()> {
     debug!("running inspect command");
 
     // Read from the kernel by id
-    let pkt_counts_v4 = load_percpu_map::<u32, u64>("PKT_COUNTS_V4", 4)?;
-    let pkt_counts_v6 = load_percpu_map::<[u8; 16], u64>("PKT_COUNTS_V6", 16)?;
-    let unknown_counts_v4 = load_map::<u32, TokenBucket>("UNK_BKTS_V4", 4)?;
-    let unknown_counts_v6 = load_map::<[u8; 16], TokenBucket>("UNK_BKTS_V6", 16)?;
+    let pkt_counts_v4 = load_percpu_map::<u32, u64>(PKT_COUNTS_V4_MAP, 4)?;
+    let pkt_counts_v6 = load_percpu_map::<[u8; 16], u64>(PKT_COUNTS_V6_MAP, 16)?;
+    let unknown_counts_v4 = load_map::<u32, TokenBucket>(UNK_BKTS_V4_MAP, 4)?;
+    let unknown_counts_v6 = load_map::<[u8; 16], TokenBucket>(UNK_BKTS_V6_MAP, 16)?;
 
     // Allow and Block buckets, read from their pins
-    let allowed_v4 = load_pinned_lru::<u32, Reputation>("ALLOWED_BUCKETS_V4")?;
-    let allowed_v6 = load_pinned_lru::<[u8; 16], Reputation>("ALLOWED_BUCKETS_V6")?;
-    let blocked_v4 = load_pinned_lru::<u32, BlockedEntry>("BLOCKED_BUCKETS_V4")?;
-    let blocked_v6 = load_pinned_lru::<[u8; 16], BlockedEntry>("BLOCKED_BUCKETS_V6")?;
+    let allowed_v4 = load_pinned_lru::<u32, Reputation>(ALLOWED_V4_MAP)?;
+    let allowed_v6 = load_pinned_lru::<[u8; 16], Reputation>(ALLOWED_V6_MAP)?;
+    let blocked_v4 = load_pinned_lru::<u32, BlockedEntry>(BLOCKED_V4_MAP)?;
+    let blocked_v6 = load_pinned_lru::<[u8; 16], BlockedEntry>(BLOCKED_V6_MAP)?;
 
     debug!("all maps loaded");
 
@@ -515,9 +519,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Check if the '/sys/fs/bpf/bpfimp' directory exists,
-    // if not create it
-    let path = Path::new("/sys/fs/bpf/bpfimp");
+    // Check if the bpffs pin directory exists, if not create it
+    let path = Path::new(BPFS_FS_PATH);
     if !path.exists() {
         DirBuilder::new()
             .recursive(true)
@@ -554,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
     // reach for `Bpf::load_file` instead.
     let mut ebpf =
         EbpfLoader::new()
-            .map_pin_path("/sys/fs/bpf/bpfimp")
+            .map_pin_path(BPFS_FS_PATH)
             .load(aya::include_bytes_aligned!(concat!(
                 env!("OUT_DIR"),
                 "/bpfimp"
