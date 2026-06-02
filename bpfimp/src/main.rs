@@ -16,7 +16,7 @@ use aya::{
 };
 use bpfimp_common::{BlockedEntry, EventKind, ImpEvent, Reputation, TokenBucket};
 use clap::{ArgMatches, Command, arg};
-use log::{error, info};
+use log::{debug, error, info, warn};
 use nix::time::{ClockId, clock_gettime};
 use notify::{
     RecursiveMode,
@@ -28,8 +28,6 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::mpsc,
 };
-#[rustfmt::skip]
-use log::{debug, warn};
 
 const BPFS_FS_PATH: &str = "/sys/fs/bpf/bpfimp";
 
@@ -105,12 +103,30 @@ fn clock_now_ns() -> u64 {
 
 fn cli() -> Command {
     Command::new("bpfimp")
-        .about("")
+        .about("XDP-based per-source-IP packet rate limiter")
+        .long_about(
+            "Attaches an XDP program that meters traffic per source IP against a \
+             token bucket in the kernel. A userspace control plane hot-reloads \
+             allow/block lists from a TOML file, snapshots live state, and streams \
+             drop events over a ring buffer. Must be run as root.",
+        )
+        .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
+        .arg_required_else_help(true)
+        .after_help(
+            "EXAMPLES:\n  \
+             # Attach to eth0, reconciling lists from ./bpfimp.toml on save\n  \
+             sudo bpfimp run --iface eth0\n\n  \
+             # Snapshot live state as JSON (requires a running instance)\n  \
+             sudo bpfimp inspect --json\n\n  \
+             # Stream drop events as newline-delimited JSON\n  \
+             sudo bpfimp watch --json | jq .\n\n\
+             Set RUST_LOG=info (or debug/trace) to control log verbosity.",
+        )
         .subcommand(
             Command::new("run")
-                .about("run the binary")
-                .arg(arg!(-i --iface <IFACE> "the interface to attach to").default_value("wlan0"))
+                .about("load and attach the XDP program, then hot-reload the config")
+                .arg(arg!(-i --iface <IFACE> "the interface to attach to").required(true))
                 .arg(
                     arg!(-c --config <CONFIG> "path to config file")
                         .default_value("bpfimp.toml")
@@ -119,7 +135,7 @@ fn cli() -> Command {
         )
         .subcommand(
             Command::new("inspect")
-                .about("inspect bpf data persisted over runs")
+                .about("snapshot live and persisted bpf state (requires a running instance)")
                 .arg(arg!(-j --json "output as json")),
         )
         .subcommand(
@@ -196,18 +212,6 @@ fn map_of<'a, K: Pod, V: Pod>(
             .with_context(|| format!("map {name} not found"))?,
     )?)
 }
-
-// /// Returns an `aya::maps::PerCpuHashMap` with the name provided if one
-// /// exists
-//fn percpu_map_of<'a, K: Pod, V: Pod>(
-//    ebpf: &'a mut Ebpf,
-//    name: &str,
-//) -> Result<PerCpuHashMap<&'a mut MapData, K, V>> {
-//    Ok(PerCpuHashMap::try_from(
-//        ebpf.map_mut(name)
-//            .with_context(|| format!("map {name} not found"))?,
-//    )?)
-//}
 
 /// Return the per cpu map using 'loaded_maps()' if it exists on the host
 /// system
@@ -366,6 +370,15 @@ fn print_human(output: &InspectOutput) {
     }
 }
 
+/// Fetch the loaded `bpfimp` XDP program from the ebpf object, with distinct
+/// errors for the two failure modes (missing program vs. wrong program type).
+fn xdp_program(ebpf: &mut Ebpf) -> Result<&mut Xdp> {
+    ebpf.program_mut("bpfimp")
+        .context("program 'bpfimp' not found")?
+        .try_into()
+        .context("program 'bpfimp' is not an Xdp program")
+}
+
 /// Check that a bpfimp instance is loaded before trying to read its maps,
 /// so callers get one clear message instead of a per-map load error
 fn ensure_running() -> Result<()> {
@@ -483,12 +496,12 @@ fn inspect(sub_matches: &ArgMatches) -> Result<()> {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    if !nix::unistd::geteuid().is_root() {
-        error!("binary must be ran with root privaleges");
-        return Err(anyhow!("Binary must be ran as root"));
-    }
-
     let cli = cli().get_matches();
+
+    if !nix::unistd::geteuid().is_root() {
+        error!("binary must be run with root privileges");
+        return Err(anyhow!("binary must be run as root"));
+    }
 
     if let Some(("inspect", sub_matches)) = cli.subcommand() {
         inspect(sub_matches).with_context(|| "failed to handle inspect command")?;
@@ -551,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
         warn!("failed to initialize eBPF logger: {e}");
     }
 
-    let program: &mut Xdp = ebpf.program_mut("bpfimp").unwrap().try_into()?;
+    let program = xdp_program(&mut ebpf)?;
     program.load()?;
     let link = program.attach(iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
@@ -587,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = sigterm.recv() => {
-                info!("SIGTERM recieved, exiting...");
+                info!("SIGTERM received, exiting...");
                 break;
             }
             Some(Ok(events)) = rx.recv() => {
@@ -608,11 +621,7 @@ async fn main() -> anyhow::Result<()> {
 
     drop(debouncer);
 
-    let program: &mut Xdp = ebpf
-        .program_mut("bpfimp")
-        .context("failed to get Xdp program for teardown")?
-        .try_into()
-        .context("program 'bpfimp' is not an Xdp program")?;
+    let program = xdp_program(&mut ebpf)?;
 
     if let Err(e) = program.detach(link) {
         warn!("failed to detach Xdp program cleanly: {e}");
