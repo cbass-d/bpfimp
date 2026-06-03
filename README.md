@@ -201,9 +201,9 @@ unknown IP's bucket; an allowed peer with a healthy score absorbs bursts up to
 `bpfimp` is subcommand-based and must be run as root:
 
 ```
-bpfimp run [--iface <NAME>] [--config <PATH>]
+bpfimp run --iface <NAME> [--config <PATH>]
 
-  -i, --iface   interface to attach XDP to (default: wlan0)
+  -i, --iface   interface to attach XDP to (required)
   -c, --config  path to bpfimp.toml (default: ./bpfimp.toml)
 
 bpfimp inspect [--json]
