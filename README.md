@@ -236,17 +236,6 @@ bpfimp watch   [--json]
   (some virtio configs), switch to `XdpFlags::SKB_MODE` in
   `bpfimp/src/main.rs`.
 
-## Cross-compiling
-
-```shell
-CC=${ARCH}-linux-musl-gcc cargo build --package bpfimp --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"${ARCH}-linux-musl-gcc\"
-```
-
-The resulting `target/${ARCH}-unknown-linux-musl/release/bpfimp` can be copied
-to a Linux host and run there.
-
 ## License
 
 With the exception of eBPF code, bpfimp is distributed under the terms of
