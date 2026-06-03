@@ -8,6 +8,23 @@ Handles both IPv4 and IPv6.
 
 > Status: working demo. Tested against a veth/netns harness.
 
+## Demo
+
+![bpfimp rate-limiting a flood and hot-reloading its policy](demo/demo.gif)
+
+A single source IP is flooded with 500 packets under three policies, with no
+restart between them — the userspace control plane (top-left) hot-reloads each
+change and drop events stream live over the ring buffer (top-right):
+
+1. **Unknown peer** — rate-limited by a token bucket: ~138/500 pass
+   (100 starting tokens + ~10/s refill over the flood).
+2. **Blocklisted** — every packet is `XDP_DROP`'d at the blocklist: ~100% loss.
+3. **Allowlisted** — a larger bucket plus reputation scoring: ~240/500 pass.
+
+The recording is scripted with [vhs]; regenerate it with `vhs demo/demo.tape`
+(see the header of [`demo/demo.tape`](demo/demo.tape) for prerequisites — a
+release build and passwordless sudo for the duration of the capture).
+
 ## What it does
 
 For every IPv4 or IPv6 packet arriving on the attached interface, the XDP
@@ -239,6 +256,7 @@ All eBPF code is distributed under either the terms of the
 [GNU General Public License, Version 2] or the [MIT license], at your option.
 
 [aya]: https://github.com/aya-rs/aya
+[vhs]: https://github.com/charmbracelet/vhs
 [Apache license]: LICENSE-APACHE
 [MIT license]: LICENSE-MIT
 [GNU General Public License, Version 2]: LICENSE-GPL2
