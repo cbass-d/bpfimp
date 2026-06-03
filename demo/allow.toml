@@ -1,0 +1,4 @@
+# Trust the peer: allowlisted IPs get a larger MAX_TOKENS (200) bucket plus a
+# reputation score that gates the bucket and recovers on good behaviour.
+allowlist = ["10.200.0.2"]
+blocklist = []

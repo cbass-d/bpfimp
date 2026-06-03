@@ -1,0 +1,4 @@
+# Peer 10.200.0.2 is neither allowed nor blocked, so it is treated as an
+# unknown IP: a fresh token bucket seeded with NEW_MAX_TOKENS (100).
+allowlist = []
+blocklist = []
