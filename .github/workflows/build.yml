@@ -12,7 +12,7 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + build
+    name: fmt + clippy + build + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,3 +47,8 @@ jobs:
 
       - name: cargo build (release)
         run: cargo +stable build --workspace --exclude bpfimp-ebpf --release
+
+      # bpfimp-ebpf is no_std and targets bpfel-unknown-none, so it has no
+      # host-runnable tests; it's still compiled as a build dependency above.
+      - name: cargo test
+        run: cargo +stable test --workspace --exclude bpfimp-ebpf
