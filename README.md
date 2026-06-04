@@ -41,12 +41,12 @@ program:
    - **Allowed peers** (`ALLOWED_BUCKETS_V4` / `ALLOWED_BUCKETS_V6`) — IPs
      loaded from `bpfimp.toml`. Each has a token bucket *and* a reputation
      score. The score gates the bucket: an IP only passes if
-     `score >= MIN_SCORE_TO_PASS` *and* a token is available. Successful
-     packets nudge the score up (capped at `MAX_SCORE`); a denied packet
-     subtracts `PENALTY`. This lets a trusted peer absorb a burst but get
+     `score >= min_score_to_pass` *and* a token is available. Successful
+     packets nudge the score up (capped at `max_score`); a denied packet
+     subtracts `penalty`. This lets a trusted peer absorb a burst but get
      throttled if it sustains abuse.
    - **Unknown IPs** (`UNK_BKTS_V4` / `UNK_BKTS_V6`) — auto-inserted with a
-     smaller starting balance (`NEW_MAX_TOKENS`) and a plain token bucket.
+     smaller starting balance (`new_max_tokens`) and a plain token bucket.
 4. Returns `XDP_PASS` or `XDP_DROP` based on the result. On every drop
    (blocklist hit *or* an empty bucket) it also pushes a compact event record
    onto a ring buffer (`EVENTS`) that userspace can stream live — see
