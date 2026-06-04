@@ -3,7 +3,14 @@ name: build
 on:
   push:
     branches: [main]
+    paths-ignore: &docs
+      - '**.md'
+      - 'demo/**'
+      - 'LICENSE-*'
+      - '.gitignore'
+      - 'bpfimp.toml.example'
   pull_request:
+    paths-ignore: *docs
   workflow_dispatch:
 
 env:
