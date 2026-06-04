@@ -10,13 +10,13 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use aya::{
     Ebpf, EbpfLoader, Pod,
-    maps::{HashMap, Map, MapData, PerCpuHashMap, RingBuf, loaded_maps},
+    maps::{Array, HashMap, Map, MapData, PerCpuHashMap, RingBuf, loaded_maps},
     programs::{Xdp, XdpFlags, loaded_programs},
 };
 use bpfimp_common::{
     ALLOWED_V4_MAP, ALLOWED_V6_MAP, BLOCKED_V4_MAP, BLOCKED_V6_MAP, BPF_PROGRAM, BlockedEntry,
-    EVENTS_RINGBUF, EventKind, ImpEvent, PKT_COUNTS_V4_MAP, PKT_COUNTS_V6_MAP, Reputation,
-    TokenBucket, UNK_BKTS_V4_MAP, UNK_BKTS_V6_MAP,
+    EVENTS_RINGBUF, EventKind, ImpEvent, PKT_COUNTS_V4_MAP, PKT_COUNTS_V6_MAP, POLICY_MAP,
+    PolicyConfig, Reputation, TokenBucket, UNK_BKTS_V4_MAP, UNK_BKTS_V6_MAP,
 };
 use clap::{ArgMatches, Command, arg};
 use log::{debug, error, info, warn};
@@ -39,6 +39,49 @@ struct Config {
     #[serde(default)]
     allowlist: Vec<String>,
     blocklist: Vec<String>,
+    #[serde(default)]
+    policy: PolicyToml,
+}
+
+/// The `[policy]` table in bpfimp.toml. Every knob is optional; `#[serde(default)]`
+/// fills any omitted field from `Default` (the compile-time `PolicyConfig::DEFAULT`),
+/// so an absent `[policy]` table reproduces the built-in behavior exactly.
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct PolicyToml {
+    max_tokens: u32,
+    new_max_tokens: u32,
+    refill_per_sec: u32,
+    max_score: u32,
+    min_score_to_pass: u32,
+    penalty: u32,
+}
+
+impl Default for PolicyToml {
+    fn default() -> Self {
+        let d = PolicyConfig::DEFAULT;
+        Self {
+            max_tokens: d.max_tokens,
+            new_max_tokens: d.new_max_tokens,
+            refill_per_sec: d.refill_per_sec,
+            max_score: d.max_score,
+            min_score_to_pass: d.min_score_to_pass,
+            penalty: d.penalty,
+        }
+    }
+}
+
+impl From<&PolicyToml> for PolicyConfig {
+    fn from(p: &PolicyToml) -> Self {
+        Self {
+            max_tokens: p.max_tokens,
+            new_max_tokens: p.new_max_tokens,
+            refill_per_sec: p.refill_per_sec,
+            max_score: p.max_score,
+            min_score_to_pass: p.min_score_to_pass,
+            penalty: p.penalty,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -186,6 +229,17 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let (allow_v4, allow_v6) = partition_list(&cfg.allowlist);
     let (block_v4, block_v6) = partition_list(&cfg.blocklist);
     let now = clock_now_ns();
+    let policy = PolicyConfig::from(&cfg.policy);
+
+    // Push the active policy into the single-entry POLICY map the kernel reads
+    // per packet. Scoped so the &mut ebpf borrow is released before sync_keys.
+    {
+        let mut policy_map: Array<&mut MapData, PolicyConfig> = Array::try_from(
+            ebpf.map_mut(POLICY_MAP)
+                .with_context(|| format!("map {POLICY_MAP} not found"))?,
+        )?;
+        policy_map.set(0, policy, 0)?;
+    }
 
     let allow_v4: HashSet<u32> = allow_v4.into_iter().collect();
     let allow_v6: HashSet<[u8; 16]> = allow_v6.into_iter().collect();
@@ -193,10 +247,10 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let block_v6: HashSet<[u8; 16]> = block_v6.into_iter().collect();
 
     sync_keys(&mut map_of(ebpf, ALLOWED_V4_MAP)?, &allow_v4, |_| {
-        Reputation::new(now)
+        Reputation::new(now, policy.max_tokens, policy.max_score)
     })?;
     sync_keys(&mut map_of(ebpf, ALLOWED_V6_MAP)?, &allow_v6, |_| {
-        Reputation::new(now)
+        Reputation::new(now, policy.max_tokens, policy.max_score)
     })?;
     sync_keys(&mut map_of(ebpf, BLOCKED_V4_MAP)?, &block_v4, |_| {
         BlockedEntry::default()
@@ -650,9 +704,35 @@ mod tests {
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
     };
 
-    use bpfimp_common::{EventKind, ImpEvent};
+    use bpfimp_common::{EventKind, ImpEvent, PolicyConfig};
 
-    use crate::{WatchEvent, key_diff, partition_list};
+    use crate::{Config, WatchEvent, key_diff, partition_list};
+
+    #[test]
+    fn policy_defaults_when_table_absent() {
+        // No [policy] table at all -> every knob falls back to the built-in default.
+        let cfg: Config = toml::from_str("blocklist = []").unwrap();
+        let p = PolicyConfig::from(&cfg.policy);
+
+        assert_eq!(p.max_tokens, PolicyConfig::DEFAULT.max_tokens);
+        assert_eq!(p.new_max_tokens, PolicyConfig::DEFAULT.new_max_tokens);
+        assert_eq!(p.penalty, PolicyConfig::DEFAULT.penalty);
+    }
+
+    #[test]
+    fn policy_partial_override_keeps_other_defaults() {
+        // A [policy] table that sets only one knob overrides that one and
+        // leaves the rest at their defaults.
+        let cfg: Config =
+            toml::from_str("blocklist = []\n[policy]\nmax_tokens = 999\nrefill_per_sec = 1")
+                .unwrap();
+        let p = PolicyConfig::from(&cfg.policy);
+
+        assert_eq!(p.max_tokens, 999);
+        assert_eq!(p.refill_per_sec, 1);
+        assert_eq!(p.max_score, PolicyConfig::DEFAULT.max_score);
+        assert_eq!(p.min_score_to_pass, PolicyConfig::DEFAULT.min_score_to_pass);
+    }
 
     #[test]
     fn key_diff_adds_new() {

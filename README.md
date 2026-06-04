@@ -182,17 +182,29 @@ peer keeps its accumulated reputation across edits instead of being reset.
 
 ## Policy knobs
 
-The rate-limit constants live in [`bpfimp-common/src/lib.rs`](bpfimp-common/src/lib.rs)
-and apply uniformly to both v4 and v6:
+The rate-limit knobs apply uniformly to both v4 and v6. Each has a built-in
+default (in [`bpfimp-common/src/lib.rs`](bpfimp-common/src/lib.rs)) and can be
+overridden at runtime from an optional `[policy]` table in `bpfimp.toml`:
 
-| Constant            | Default | Meaning                                                       |
+| Config key          | Default | Meaning                                                       |
 | ------------------- | ------- | ------------------------------------------------------------- |
-| `MAX_TOKENS`        | 200     | Bucket cap for established (allowed) peers                    |
-| `NEW_MAX_TOKENS`    | 100     | Starting balance for newly-seen unknown IPs                   |
-| `REFILL_PER_SEC`    | 10      | Tokens replenished per second                                 |
-| `MAX_SCORE`         | 100     | Cap on reputation score                                       |
-| `MIN_SCORE_TO_PASS` | 20      | Score floor below which an allowed peer is dropped            |
-| `PENALTY`           | 10      | Score subtracted on a denied packet                           |
+| `max_tokens`        | 200     | Bucket cap for established (allowed) peers                    |
+| `new_max_tokens`    | 100     | Starting balance for newly-seen unknown IPs                   |
+| `refill_per_sec`    | 10      | Tokens replenished per second                                 |
+| `max_score`         | 100     | Cap on reputation score                                       |
+| `min_score_to_pass` | 20      | Score floor below which an allowed peer is dropped            |
+| `penalty`           | 10      | Score subtracted on a denied packet                           |
+
+```toml
+[policy]
+max_tokens = 500       # any subset of keys is fine; omitted ones keep their default
+refill_per_sec = 25
+```
+
+The values are pushed into a single-entry `POLICY` BPF map that the kernel
+program reads on every packet, and — like the allow/block lists — they are
+**hot-reloaded** on save with no restart. An absent `[policy]` table (or an
+absent key) reproduces the built-in defaults exactly.
 
 With the defaults a steady rate above ~10 pkt/s will eventually empty an
 unknown IP's bucket; an allowed peer with a healthy score absorbs bursts up to

@@ -1,2 +1,12 @@
 allowlist = []
 blocklist = ["fd00:200::2"]
+
+# Optional: override the rate-limit knobs. Any omitted key keeps its built-in
+# default (shown below). Edits are hot-reloaded on save, no restart needed.
+# [policy]
+# max_tokens = 200
+# new_max_tokens = 100
+# refill_per_sec = 10
+# max_score = 100
+# min_score_to_pass = 20
+# penalty = 10

@@ -10,6 +10,7 @@ pub const PKT_COUNTS_V4_MAP: &str = "PKT_COUNTS_V4";
 pub const PKT_COUNTS_V6_MAP: &str = "PKT_COUNTS_V6";
 pub const UNK_BKTS_V4_MAP: &str = "UNK_BKTS_V4";
 pub const UNK_BKTS_V6_MAP: &str = "UNK_BKTS_V6";
+pub const POLICY_MAP: &str = "POLICY";
 
 pub const MAX_TOKENS: u32 = 200;
 pub const MAX_SCORE: u32 = 100;
@@ -42,6 +43,31 @@ pub struct ImpEvent {
     pub _pad: [u8; 6],
 }
 
+/// Runtime-tunable policy knobs, pushed from userspace into the single-entry
+/// `POLICY` array map and read by the kernel program on every packet
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyConfig {
+    pub max_tokens: u32,
+    pub new_max_tokens: u32,
+    pub refill_per_sec: u32,
+    pub max_score: u32,
+    pub min_score_to_pass: u32,
+    pub penalty: u32,
+}
+
+impl PolicyConfig {
+    /// The compile-time defaults, used by the kernel as a fallback
+    pub const DEFAULT: Self = Self {
+        max_tokens: MAX_TOKENS,
+        new_max_tokens: NEW_MAX_TOKENS,
+        refill_per_sec: REFILL_PER_SEC,
+        max_score: MAX_SCORE,
+        min_score_to_pass: MIN_SCORE_TO_PASS,
+        penalty: PENALTY,
+    };
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TokenBucket {
@@ -50,9 +76,9 @@ pub struct TokenBucket {
 }
 
 impl TokenBucket {
-    pub fn new(now_ns: u64, new: bool) -> Self {
+    pub fn new(now_ns: u64, initial_tokens: u32) -> Self {
         Self {
-            tokens: if new { NEW_MAX_TOKENS } else { MAX_TOKENS },
+            tokens: initial_tokens,
             last_refill_ns: now_ns,
         }
     }
@@ -82,10 +108,10 @@ pub struct Reputation {
 }
 
 impl Reputation {
-    pub fn new(now_ns: u64) -> Self {
+    pub fn new(now_ns: u64, max_tokens: u32, max_score: u32) -> Self {
         Self {
-            bucket: TokenBucket::new(now_ns, false),
-            score: MAX_SCORE,
+            bucket: TokenBucket::new(now_ns, max_tokens),
+            score: max_score,
         }
     }
 }
@@ -108,6 +134,9 @@ unsafe impl aya::Pod for BlockedEntry {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ImpEvent {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PolicyConfig {}
 
 #[cfg(test)]
 mod tests {

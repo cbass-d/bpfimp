@@ -7,13 +7,12 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{LruHashMap, LruPerCpuHashMap, RingBuf},
+    maps::{Array, LruHashMap, LruPerCpuHashMap, RingBuf},
     programs::XdpContext,
 };
 use aya_log_ebpf::{info, trace};
 use bpfimp_common::{
-    BlockedEntry, EventKind, ImpEvent, IpVersion, MAX_SCORE, MAX_TOKENS, MIN_SCORE_TO_PASS,
-    PENALTY, REFILL_PER_SEC, Reputation, TokenBucket,
+    BlockedEntry, EventKind, ImpEvent, IpVersion, PolicyConfig, Reputation, TokenBucket,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -22,6 +21,17 @@ use network_types::{
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+// Single-entry config map. Userspace writes the active PolicyConfig here from
+// bpfimp.toml; the kernel reads it on every packet, falling back to the
+// compile-time defaults until userspace populates it.
+#[map]
+static POLICY: Array<PolicyConfig> = Array::<PolicyConfig>::with_max_entries(1, 0);
+
+#[inline(always)]
+fn policy() -> PolicyConfig {
+    POLICY.get(0).copied().unwrap_or(PolicyConfig::DEFAULT)
+}
 
 #[map]
 static PKT_COUNTS_V4: LruPerCpuHashMap<u32, u64> =
@@ -123,23 +133,26 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     }
 
     let now = unsafe { bpf_ktime_get_ns() };
+    let cfg = policy();
     let allowed = unsafe {
         if let Some(rep) = ALLOWED_BUCKETS_V4.get_ptr_mut(&src_addr) {
-            let is_ok = ((*rep).score >= MIN_SCORE_TO_PASS)
-                && (*rep).bucket.try_consume(MAX_TOKENS, REFILL_PER_SEC, now);
+            let is_ok = ((*rep).score >= cfg.min_score_to_pass)
+                && (*rep)
+                    .bucket
+                    .try_consume(cfg.max_tokens, cfg.refill_per_sec, now);
 
             if is_ok {
-                (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
+                (*rep).score = (*rep).score.saturating_add(1).min(cfg.max_score);
             } else {
                 info!(ctx, "IP: {} penalized", src_addr);
-                (*rep).score = (*rep).score.saturating_sub(PENALTY);
+                (*rep).score = (*rep).score.saturating_sub(cfg.penalty);
             }
 
             is_ok
         } else if let Some(b) = UNK_BKTS_V4.get_ptr_mut(&src_addr) {
-            (*b).try_consume(MAX_TOKENS, REFILL_PER_SEC, now)
+            (*b).try_consume(cfg.max_tokens, cfg.refill_per_sec, now)
         } else {
-            let fresh = TokenBucket::new(now, true);
+            let fresh = TokenBucket::new(now, cfg.new_max_tokens);
             let _ = UNK_BKTS_V4.insert(&src_addr, &fresh, 0);
             true
         }
@@ -183,23 +196,26 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
     }
 
     let now = unsafe { bpf_ktime_get_ns() };
+    let cfg = policy();
     let allowed = unsafe {
         if let Some(rep) = ALLOWED_BUCKETS_V6.get_ptr_mut(&src_addr) {
-            let is_ok = (*rep).score >= MIN_SCORE_TO_PASS
-                && (*rep).bucket.try_consume(MAX_TOKENS, REFILL_PER_SEC, now);
+            let is_ok = (*rep).score >= cfg.min_score_to_pass
+                && (*rep)
+                    .bucket
+                    .try_consume(cfg.max_tokens, cfg.refill_per_sec, now);
 
             if is_ok {
-                (*rep).score = (*rep).score.saturating_add(1).min(MAX_SCORE);
+                (*rep).score = (*rep).score.saturating_add(1).min(cfg.max_score);
             } else {
                 info!(ctx, "IPv6 {:i} penalized", src_addr);
-                (*rep).score = (*rep).score.saturating_sub(PENALTY);
+                (*rep).score = (*rep).score.saturating_sub(cfg.penalty);
             }
 
             is_ok
         } else if let Some(b) = UNK_BKTS_V6.get_ptr_mut(&src_addr) {
-            (*b).try_consume(MAX_TOKENS, REFILL_PER_SEC, now)
+            (*b).try_consume(cfg.max_tokens, cfg.refill_per_sec, now)
         } else {
-            let fresh = TokenBucket::new(now, true);
+            let fresh = TokenBucket::new(now, cfg.new_max_tokens);
             let _ = UNK_BKTS_V6.insert(&src_addr, &fresh, 0);
             true
         }
