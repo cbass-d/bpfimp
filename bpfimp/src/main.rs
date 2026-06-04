@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 use std::{
     collections::HashSet,
     fs::DirBuilder,
@@ -8,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context as _;
+use anyhow::{Context as _, Result, anyhow};
 use aya::{
     Ebpf, EbpfLoader, Pod,
     maps::{HashMap, Map, MapData, PerCpuHashMap, RingBuf, loaded_maps},

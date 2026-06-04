@@ -90,7 +90,7 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 }
 
 fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
     let src_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
 
     let mut addr = [0u8; 16];
@@ -153,7 +153,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
 }
 
 fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
-    let ipv6hdr: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+    let ipv6hdr: *const Ipv6Hdr = ptr_at(ctx, EthHdr::LEN)?;
     let src_addr = unsafe { (*ipv6hdr).src_addr };
 
     if let Some(entry) = BLOCKED_BUCKETS_V6.get_ptr_mut(&src_addr) {
