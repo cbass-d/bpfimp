@@ -70,7 +70,7 @@ struct InspectOutput {
     unknown_buckets: Vec<IpAddr>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WatchEvent {
     Drop {
@@ -152,7 +152,7 @@ fn cli() -> Command {
 /// Sync the keys in maps using the `desired` hashset
 fn sync_keys<K, V>(
     map: &mut HashMap<&mut MapData, K, V>,
-    desired: &HashSet<K>,
+    updated: &HashSet<K>,
     make_value: impl Fn(&K) -> V,
 ) -> Result<()>
 where
@@ -160,16 +160,23 @@ where
     V: Pod,
 {
     let current: HashSet<K> = map.keys().filter_map(|k| k.ok()).collect();
+    let (to_remove, to_add) = key_diff(&current, updated);
 
-    for k in current.difference(desired) {
-        map.remove(k)?;
+    for k in to_remove {
+        map.remove(&k)?;
     }
-
-    for k in desired.difference(&current) {
-        map.insert(k, make_value(k), 0)?;
+    for k in to_add {
+        map.insert(k, make_value(&k), 0)?;
     }
 
     Ok(())
+}
+
+fn key_diff<K: Eq + Hash + Copy>(current: &HashSet<K>, updated: &HashSet<K>) -> (Vec<K>, Vec<K>) {
+    (
+        current.difference(updated).copied().collect(),
+        updated.difference(current).copied().collect(),
+    )
 }
 
 fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
@@ -533,8 +540,10 @@ async fn main() -> anyhow::Result<()> {
             sub_matches
                 .get_one::<String>("iface")
                 .map(|s| s.as_str())
-                .unwrap(),
-            sub_matches.get_one::<PathBuf>("config").unwrap(),
+                .expect("unable to get iface arg from matches"),
+            sub_matches
+                .get_one::<PathBuf>("config")
+                .expect("unable to get config arg from matches"),
         )
     } else {
         return Ok(());
@@ -633,4 +642,146 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashSet,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    };
+
+    use bpfimp_common::{EventKind, ImpEvent};
+
+    use crate::{WatchEvent, key_diff, partition_list};
+
+    #[test]
+    fn key_diff_adds_new() {
+        let current = HashSet::from([1, 2]);
+        let updated = HashSet::from([1, 2, 3]);
+
+        let (to_remove, to_add) = key_diff(&current, &updated);
+
+        assert!(to_add.contains(&3));
+        assert!(to_remove.is_empty());
+    }
+
+    #[test]
+    fn key_diff_removes_old() {
+        let current = HashSet::from([1, 2]);
+        let updated = HashSet::from([1]);
+
+        let (to_remove, to_add) = key_diff(&current, &updated);
+
+        assert!(to_remove.contains(&2));
+        assert!(to_add.is_empty());
+    }
+
+    #[test]
+    fn key_diff_does_nothing() {
+        let current = HashSet::from([1]);
+        let updated = HashSet::from([1]);
+
+        let (to_remove, to_add) = key_diff(&current, &updated);
+
+        assert!(to_add.is_empty());
+        assert!(to_remove.is_empty());
+    }
+
+    #[test]
+    fn partition_ignores_invalid() {
+        let list = [
+            "1111.333.412".to_string(),
+            "badip".to_string(),
+            "ge80::8ca9:bf10f:ghf4:9b70".to_string(),
+        ];
+
+        let (v4, v6) = partition_list(&list);
+
+        assert!(v4.is_empty());
+        assert!(v6.is_empty());
+    }
+
+    #[test]
+    fn partition_valid_v4_and_v6() {
+        let list = ["10.0.20.1".to_string(), "fd00:200::1".to_string()];
+
+        let (v4, v6) = partition_list(&list);
+
+        assert_eq!(v4[0], u32::from(Ipv4Addr::from([10, 0, 20, 1])));
+        let expected = "fd00:200::1".parse::<Ipv6Addr>().unwrap().octets();
+        assert_eq!(v6[0], expected)
+    }
+
+    #[test]
+    fn from_wire_invalid_ipv() {
+        let event = ImpEvent {
+            ts_ns: 0,
+            addr: "fd00:200::1".parse::<Ipv6Addr>().unwrap().octets(),
+            kind: 0,
+            ip_version: 3,
+            _pad: [0; 6],
+        };
+
+        let err = WatchEvent::from_wire(&event).unwrap_err();
+        assert_eq!(err.to_string(), "invalid ip version on wire: 3");
+    }
+
+    #[test]
+    fn from_wire_invalid_kind() {
+        let event = ImpEvent {
+            ts_ns: 0,
+            addr: "fd00:200::1".parse::<Ipv6Addr>().unwrap().octets(),
+            kind: 1,
+            ip_version: 4,
+            _pad: [0; 6],
+        };
+
+        let err = WatchEvent::from_wire(&event).unwrap_err();
+        assert_eq!(err.to_string(), "invalid event kind on wire: 1");
+    }
+
+    #[test]
+    fn from_wire_valid_v4() {
+        let mut addr = [0u8; 16];
+        addr[..4].copy_from_slice(&[10, 0, 20, 1]);
+        let event = ImpEvent {
+            ts_ns: 42,
+            addr,
+            kind: EventKind::Drop as u8,
+            ip_version: 4,
+            _pad: [0; 6],
+        };
+
+        let parsed = WatchEvent::from_wire(&event).unwrap();
+        assert_eq!(
+            parsed,
+            WatchEvent::Drop {
+                ts_ns: 42,
+                ip: IpAddr::V4(Ipv4Addr::new(10, 0, 20, 1)),
+                ip_version: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn from_wire_valid_v6() {
+        let event = ImpEvent {
+            ts_ns: 7,
+            addr: "fd00:200::1".parse::<Ipv6Addr>().unwrap().octets(),
+            kind: EventKind::Drop as u8,
+            ip_version: 6,
+            _pad: [0; 6],
+        };
+
+        let parsed = WatchEvent::from_wire(&event).unwrap();
+        assert_eq!(
+            parsed,
+            WatchEvent::Drop {
+                ts_ns: 7,
+                ip: IpAddr::V6("fd00:200::1".parse::<Ipv6Addr>().unwrap()),
+                ip_version: 6,
+            }
+        );
+    }
 }
