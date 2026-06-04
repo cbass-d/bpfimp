@@ -1,3 +1,5 @@
+[![build](https://github.com/cbass-d/bpfimp/actions/workflows/build.yml/badge.svg)](https://github.com/cbass-d/bpfimp/actions/workflows/build.yml)
+
 # bpfimp
 
 An XDP-based packet rate limiter written in Rust with [aya]. Traffic is
