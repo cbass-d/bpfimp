@@ -24,38 +24,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+      
+      - name: Cache Nix Store
+        uses: nix-community/cache-nix-action@v6
         with:
-          components: rustfmt, clippy
-
-      - name: Install nightly toolchain (for eBPF + rustfmt)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: bpfimp
-          cache-on-failure: true
-
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
 
       - name: cargo fmt
-        run: cargo +nightly fmt --all -- --check
+        run: nix develop -c cargo fmt --all -- --check
 
       - name: cargo clippy (workspace)
-        run: cargo +stable clippy --workspace --exclude bpfimp-ebpf --all-targets -- -D warnings
+        run: nix develop -c cargo clippy --workspace --exclude bpfimp-ebpf --all-targets -- -D warnings
 
       - name: cargo clippy (ebpf)
-        run: cargo +nightly clippy --package bpfimp-ebpf --target bpfel-unknown-none -Z build-std=core -- -D warnings
+        run: nix develop -c cargo clippy --package bpfimp-ebpf --target bpfel-unknown-none -Z build-std=core -- -D warnings
 
       - name: cargo build (release)
-        run: cargo +stable build --workspace --exclude bpfimp-ebpf --release
+        run: nix develop -c cargo build --workspace --exclude bpfimp-ebpf --release
 
       # bpfimp-ebpf is no_std and targets bpfel-unknown-none, so it has no
       # host-runnable tests; it's still compiled as a build dependency above.
       - name: cargo test
-        run: cargo +stable test --workspace --exclude bpfimp-ebpf
+        run: nix develop -c cargo test --workspace --exclude bpfimp-ebpf
