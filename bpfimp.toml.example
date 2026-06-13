@@ -10,3 +10,4 @@ blocklist = ["fd00:200::2"]
 # max_score = 100
 # min_score_to_pass = 20
 # penalty = 10
+# recovery_per_sec = 5

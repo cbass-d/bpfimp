@@ -136,6 +136,9 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
     let cfg = policy();
     let allowed = unsafe {
         if let Some(rep) = ALLOWED_BUCKETS_V4.get_ptr_mut(&src_addr) {
+            // Recover trust on elapsed time before gating
+            (*rep).heal(now, cfg.recovery_per_sec, cfg.max_score);
+
             let is_ok = ((*rep).score >= cfg.min_score_to_pass)
                 && (*rep)
                     .bucket
@@ -199,6 +202,9 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
     let cfg = policy();
     let allowed = unsafe {
         if let Some(rep) = ALLOWED_BUCKETS_V6.get_ptr_mut(&src_addr) {
+            // Recover trust on elapsed time before gating
+            (*rep).heal(now, cfg.recovery_per_sec, cfg.max_score);
+
             let is_ok = (*rep).score >= cfg.min_score_to_pass
                 && (*rep)
                     .bucket

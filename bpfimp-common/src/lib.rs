@@ -18,6 +18,7 @@ pub const NEW_MAX_TOKENS: u32 = 100;
 pub const MIN_SCORE_TO_PASS: u32 = 20;
 pub const REFILL_PER_SEC: u32 = 10;
 pub const PENALTY: u32 = 10;
+pub const RECOVERY_PER_SEC: u32 = 5;
 const NS_PER_SEC: u64 = 1_000_000_000;
 
 #[repr(u8)]
@@ -54,6 +55,7 @@ pub struct PolicyConfig {
     pub max_score: u32,
     pub min_score_to_pass: u32,
     pub penalty: u32,
+    pub recovery_per_sec: u32,
 }
 
 impl PolicyConfig {
@@ -65,6 +67,7 @@ impl PolicyConfig {
         max_score: MAX_SCORE,
         min_score_to_pass: MIN_SCORE_TO_PASS,
         penalty: PENALTY,
+        recovery_per_sec: RECOVERY_PER_SEC,
     };
 }
 
@@ -105,6 +108,7 @@ impl TokenBucket {
 pub struct Reputation {
     pub bucket: TokenBucket,
     pub score: u32,
+    pub last_heal_ns: u64,
 }
 
 impl Reputation {
@@ -112,6 +116,19 @@ impl Reputation {
         Self {
             bucket: TokenBucket::new(now_ns, max_tokens),
             score: max_score,
+            last_heal_ns: now_ns,
+        }
+    }
+
+    /// Restore reputation over elapsed wall-clock time, independent of whether
+    /// the peer is currently passing the score gate
+    pub fn heal(&mut self, now_ns: u64, recovery_per_sec: u32, max_score: u32) {
+        let elapsed = now_ns.saturating_sub(self.last_heal_ns) / NS_PER_SEC;
+
+        if elapsed >= 1 {
+            let to_add = (elapsed as u32).saturating_mul(recovery_per_sec);
+            self.score = self.score.saturating_add(to_add).min(max_score);
+            self.last_heal_ns += elapsed * NS_PER_SEC;
         }
     }
 }
@@ -190,5 +207,60 @@ mod tests {
         };
 
         assert!(b.try_consume(100, 10, 5 * S));
+    }
+
+    #[test]
+    fn heal_pools_per_second_and_caps() {
+        let mut rep = Reputation::new(0, 0, 0);
+        rep.score = 10;
+
+        // 4s * 5/s = 20 -> 30
+        rep.heal(4 * S, 5, 100);
+        assert_eq!(rep.score, 30);
+
+        // clamps to max_score
+        rep.heal(1_000 * S, 5, 100);
+        assert_eq!(rep.score, 100);
+    }
+
+    #[test]
+    fn heal_keeps_subsecond_remainder() {
+        let mut rep = Reputation::new(0, 0, 0);
+        rep.score = 0;
+
+        // < 1s elapsed: no heal yet, and last_heal_ns must not advanc
+        rep.heal(S / 2, 5, 100);
+        assert_eq!(rep.score, 0);
+        assert_eq!(rep.last_heal_ns, 0);
+
+        // +0.5s now crosses a full second.
+        rep.heal(S, 5, 100);
+        assert_eq!(rep.score, 5);
+    }
+
+    #[test]
+    fn heal_clock_backwards_safe() {
+        let mut rep = Reputation::new(10 * S, 0, 0);
+        rep.score = 42;
+
+        rep.heal(5 * S, 5, 100);
+        assert_eq!(rep.score, 42);
+    }
+
+    #[test]
+    fn heal_recovers_past_gate() {
+        let cfg = PolicyConfig::DEFAULT;
+        let mut rep = Reputation::new(0, cfg.max_tokens, cfg.max_score);
+
+        // Penalize below the pass threshold.
+        rep.score = cfg.min_score_to_pass - 1;
+        let gate = |r: &Reputation| r.score >= cfg.min_score_to_pass;
+
+        // Starts below the cate
+        assert!(!gate(&rep));
+
+        // Idle time alone lifts it back over the threshold.
+        rep.heal(10 * S, cfg.recovery_per_sec, cfg.max_score);
+        assert!(gate(&rep));
     }
 }

@@ -55,6 +55,7 @@ struct PolicyToml {
     max_score: u32,
     min_score_to_pass: u32,
     penalty: u32,
+    recovery_per_sec: u32,
 }
 
 impl Default for PolicyToml {
@@ -67,6 +68,7 @@ impl Default for PolicyToml {
             max_score: d.max_score,
             min_score_to_pass: d.min_score_to_pass,
             penalty: d.penalty,
+            recovery_per_sec: d.recovery_per_sec,
         }
     }
 }
@@ -80,6 +82,7 @@ impl From<&PolicyToml> for PolicyConfig {
             max_score: p.max_score,
             min_score_to_pass: p.min_score_to_pass,
             penalty: p.penalty,
+            recovery_per_sec: p.recovery_per_sec,
         }
     }
 }

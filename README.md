@@ -43,8 +43,10 @@ program:
      score. The score gates the bucket: an IP only passes if
      `score >= min_score_to_pass` *and* a token is available. Successful
      packets nudge the score up (capped at `max_score`); a denied packet
-     subtracts `penalty`. This lets a trusted peer absorb a burst but get
-     throttled if it sustains abuse.
+     subtracts `penalty`. The score also heals on elapsed time at
+     `recovery_per_sec`, so a peer throttled below the floor climbs back once
+     it stops misbehaving instead of being trapped there. This lets a trusted
+     peer absorb a burst but get throttled if it sustains abuse.
    - **Unknown IPs** (`UNK_BKTS_V4` / `UNK_BKTS_V6`) — auto-inserted with a
      smaller starting balance (`new_max_tokens`) and a plain token bucket.
 4. Returns `XDP_PASS` or `XDP_DROP` based on the result. On every drop
@@ -194,6 +196,7 @@ overridden at runtime from an optional `[policy]` table in `bpfimp.toml`:
 | `max_score`         | 100     | Cap on reputation score                                       |
 | `min_score_to_pass` | 20      | Score floor below which an allowed peer is dropped            |
 | `penalty`           | 10      | Score subtracted on a denied packet                           |
+| `recovery_per_sec`  | 5       | Score healed per elapsed second, letting a throttled peer recover |
 
 ```toml
 [policy]
