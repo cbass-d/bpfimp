@@ -11,3 +11,8 @@ blocklist = ["fd00:200::2"]
 # min_score_to_pass = 20
 # penalty = 10
 # recovery_per_sec = 5
+# Aggregate cap on unknown (non-allowlisted) traffic, summed across all source
+# IPs
+# global_max = 0 to disable the limiter entirely.
+# global_max = 10000
+# global_refill_per_sec = 5000

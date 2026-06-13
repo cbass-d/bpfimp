@@ -49,6 +49,8 @@ program:
      peer absorb a burst but get throttled if it sustains abuse.
    - **Unknown IPs** (`UNK_BKTS_V4` / `UNK_BKTS_V6`) — auto-inserted with a
      smaller starting balance (`new_max_tokens`) and a plain token bucket.
+     Before an unknown IP is metered, the packet must also pass a single
+     **global bucket** (`GLOBAL_BKT`) shared by all unknown traffic
 4. Returns `XDP_PASS` or `XDP_DROP` based on the result. On every drop
    (blocklist hit *or* an empty bucket) it also pushes a compact event record
    onto a ring buffer (`EVENTS`) that userspace can stream live — see
@@ -197,6 +199,8 @@ overridden at runtime from an optional `[policy]` table in `bpfimp.toml`:
 | `min_score_to_pass` | 20      | Score floor below which an allowed peer is dropped            |
 | `penalty`           | 10      | Score subtracted on a denied packet                           |
 | `recovery_per_sec`  | 5       | Score healed per elapsed second, letting a throttled peer recover |
+| `global_max`           | 10000   | Aggregate burst for *all* unknown traffic; `0` disables the limiter |
+| `global_refill_per_sec`| 5000    | Aggregate sustained unknown packets/sec across all source IPs  |
 
 ```toml
 [policy]

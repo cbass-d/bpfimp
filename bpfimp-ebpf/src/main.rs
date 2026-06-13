@@ -7,7 +7,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{Array, LruHashMap, LruPerCpuHashMap, RingBuf},
+    maps::{Array, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
     programs::XdpContext,
 };
 use aya_log_ebpf::{info, trace};
@@ -64,6 +64,27 @@ static UNK_BKTS_V4: LruHashMap<u32, TokenBucket> =
 #[map]
 static UNK_BKTS_V6: LruHashMap<[u8; 16], TokenBucket> =
     LruHashMap::<[u8; 16], TokenBucket>::with_max_entries(1024, 0);
+
+// Aggregate token bucket for unknown (non-allowlisted) traffic, shared across
+// every unknown source IP
+#[map]
+static GLOBAL_BKT: PerCpuArray<TokenBucket> = PerCpuArray::<TokenBucket>::with_max_entries(1, 0);
+
+// Consume one token from this CPU's share of the global unknown-traffic budget.
+// `global_max == 0` disables the limiter
+#[inline(always)]
+fn global_allows(cfg: &PolicyConfig, now: u64) -> bool {
+    if cfg.global_max == 0 {
+        return true;
+    }
+
+    match GLOBAL_BKT.get_ptr_mut(0) {
+        // Should never be None for index 0; fail open rather than drop all
+        // unknown traffic on an unexpected lookup miss.
+        Some(g) => unsafe { (*g).try_consume(cfg.global_max, cfg.global_refill_per_sec, now) },
+        None => true,
+    }
+}
 
 #[xdp]
 pub fn bpfimp(ctx: XdpContext) -> u32 {
@@ -152,12 +173,14 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<bool, ()> {
             }
 
             is_ok
+        } else if !global_allows(&cfg, now) {
+            // Aggregate unknown-traffic cap hit. Drop before touching UNK_BKTS
+            false
         } else if let Some(b) = UNK_BKTS_V4.get_ptr_mut(&src_addr) {
             (*b).try_consume(cfg.max_tokens, cfg.refill_per_sec, now)
         } else {
             let fresh = TokenBucket::new(now, cfg.new_max_tokens);
-            let _ = UNK_BKTS_V4.insert(&src_addr, &fresh, 0);
-            true
+            UNK_BKTS_V4.insert(&src_addr, &fresh, 0).is_ok()
         }
     };
 
@@ -218,12 +241,14 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<bool, ()> {
             }
 
             is_ok
+        } else if !global_allows(&cfg, now) {
+            // Aggregate unknown-traffic cap hit. Drop before touching UNK_BKTS
+            false
         } else if let Some(b) = UNK_BKTS_V6.get_ptr_mut(&src_addr) {
             (*b).try_consume(cfg.max_tokens, cfg.refill_per_sec, now)
         } else {
             let fresh = TokenBucket::new(now, cfg.new_max_tokens);
-            let _ = UNK_BKTS_V6.insert(&src_addr, &fresh, 0);
-            true
+            UNK_BKTS_V6.insert(&src_addr, &fresh, 0).is_ok()
         }
     };
 

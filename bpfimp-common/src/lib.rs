@@ -10,6 +10,7 @@ pub const PKT_COUNTS_V4_MAP: &str = "PKT_COUNTS_V4";
 pub const PKT_COUNTS_V6_MAP: &str = "PKT_COUNTS_V6";
 pub const UNK_BKTS_V4_MAP: &str = "UNK_BKTS_V4";
 pub const UNK_BKTS_V6_MAP: &str = "UNK_BKTS_V6";
+pub const GLOBAL_BKT_MAP: &str = "GLOBAL_BKT";
 pub const POLICY_MAP: &str = "POLICY";
 
 pub const MAX_TOKENS: u32 = 200;
@@ -20,6 +21,10 @@ pub const REFILL_PER_SEC: u32 = 10;
 pub const PENALTY: u32 = 10;
 pub const RECOVERY_PER_SEC: u32 = 5;
 const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// Aggregate cap on *unknown* (non-allowlisted) traffic
+pub const GLOBAL_MAX: u32 = 10_000;
+pub const GLOBAL_REFILL_PER_SEC: u32 = 5_000;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +61,8 @@ pub struct PolicyConfig {
     pub min_score_to_pass: u32,
     pub penalty: u32,
     pub recovery_per_sec: u32,
+    pub global_max: u32,
+    pub global_refill_per_sec: u32,
 }
 
 impl PolicyConfig {
@@ -68,6 +75,8 @@ impl PolicyConfig {
         min_score_to_pass: MIN_SCORE_TO_PASS,
         penalty: PENALTY,
         recovery_per_sec: RECOVERY_PER_SEC,
+        global_max: GLOBAL_MAX,
+        global_refill_per_sec: GLOBAL_REFILL_PER_SEC,
     };
 }
 

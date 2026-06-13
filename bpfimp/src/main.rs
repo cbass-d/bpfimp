@@ -56,6 +56,8 @@ struct PolicyToml {
     min_score_to_pass: u32,
     penalty: u32,
     recovery_per_sec: u32,
+    global_max: u32,
+    global_refill_per_sec: u32,
 }
 
 impl Default for PolicyToml {
@@ -69,6 +71,8 @@ impl Default for PolicyToml {
             min_score_to_pass: d.min_score_to_pass,
             penalty: d.penalty,
             recovery_per_sec: d.recovery_per_sec,
+            global_max: d.global_max,
+            global_refill_per_sec: d.global_refill_per_sec,
         }
     }
 }
@@ -83,8 +87,18 @@ impl From<&PolicyToml> for PolicyConfig {
             min_score_to_pass: p.min_score_to_pass,
             penalty: p.penalty,
             recovery_per_sec: p.recovery_per_sec,
+            global_max: p.global_max,
+            global_refill_per_sec: p.global_refill_per_sec,
         }
     }
+}
+
+/// The `GLOBAL_BKT` map is per-CPU, so the kernel sums `ncpus` independent
+/// buckets
+fn divide_global_across_cpus(policy: &mut PolicyConfig, ncpus: u32) {
+    let per_cpu = |v: u32| if v == 0 { 0 } else { (v / ncpus).max(1) };
+    policy.global_max = per_cpu(policy.global_max);
+    policy.global_refill_per_sec = per_cpu(policy.global_refill_per_sec);
 }
 
 #[derive(serde::Serialize)]
@@ -232,7 +246,9 @@ fn load_config_lists(ebpf: &mut Ebpf, path: &Path) -> Result<(usize, usize)> {
     let (allow_v4, allow_v6) = partition_list(&cfg.allowlist);
     let (block_v4, block_v6) = partition_list(&cfg.blocklist);
     let now = clock_now_ns();
-    let policy = PolicyConfig::from(&cfg.policy);
+    let mut policy = PolicyConfig::from(&cfg.policy);
+    let ncpus = aya::util::nr_cpus().map(|n| n.max(1)).unwrap_or(1) as u32;
+    divide_global_across_cpus(&mut policy, ncpus);
 
     // Push the active policy into the single-entry POLICY map the kernel reads
     // per packet. Scoped so the &mut ebpf borrow is released before sync_keys.
@@ -709,7 +725,43 @@ mod tests {
 
     use bpfimp_common::{EventKind, ImpEvent, PolicyConfig};
 
-    use crate::{Config, WatchEvent, key_diff, partition_list};
+    use crate::{Config, WatchEvent, divide_global_across_cpus, key_diff, partition_list};
+
+    #[test]
+    fn global_budget_splits_across_cpus() {
+        let mut p = PolicyConfig::DEFAULT;
+        p.global_max = 10_000;
+        p.global_refill_per_sec = 5_000;
+
+        divide_global_across_cpus(&mut p, 4);
+
+        assert_eq!(p.global_max, 2_500);
+        assert_eq!(p.global_refill_per_sec, 1_250);
+    }
+
+    #[test]
+    fn global_zero_stays_disabled() {
+        let mut p = PolicyConfig::DEFAULT;
+        p.global_max = 0;
+        p.global_refill_per_sec = 0;
+
+        divide_global_across_cpus(&mut p, 64);
+
+        assert_eq!(p.global_max, 0);
+        assert_eq!(p.global_refill_per_sec, 0);
+    }
+
+    #[test]
+    fn global_nonzero_floors_at_one() {
+        let mut p = PolicyConfig::DEFAULT;
+        p.global_max = 10;
+        p.global_refill_per_sec = 3;
+
+        divide_global_across_cpus(&mut p, 64);
+
+        assert_eq!(p.global_max, 1);
+        assert_eq!(p.global_refill_per_sec, 1);
+    }
 
     #[test]
     fn policy_defaults_when_table_absent() {
